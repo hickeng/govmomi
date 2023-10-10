@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -53,6 +54,11 @@ There's a quirk where you specify an abs path that goes via a symlink dir - the 
 
 */
 
+const (
+	interposePath     = "/.shadow"
+	interposeMetaPath = interposePath + "/meta"
+)
+
 func main() {
 	// determine normalized invocation path
 	identity := os.Args[0]
@@ -64,8 +70,19 @@ func main() {
 	fmt.Printf("Invocation path: %s", invocation)
 
 	// if invoked directly, process flags
-	// - optional - we can just synthesize this through manual symlinks initially
-	// - may be best to defer until home as this part depends on manifest for input
+	if absDir == interposeMetaPath {
+		fmt.Printf("Direct invocation of interpose - processing flags")
+
+		// - optional - we can just synthesize this through manual symlinks initially
+		// - may be best to defer until home as this part depends on manifest for input
+		// --install --target / --default-source /.shadow/content --override-source /.shadow/overrides --config /.shadow/meta/esx-filesystem-manifest.json
+		flag.Bool("create-reflection", false, "If specified, interceptor will create reflections of source in target as indicated by config")
+		flag.String("target", "/", "Specify the location in which intercepted reflections will be created. Directory path.")
+		flag.String("source", "/.shadow/content", "The location of files to reflect into target. Directory path.")
+		flag.String("config", "/.shadow/meta/interceptor-config.json", "Path to the config file")
+
+		flag.Parse()
+	}
 
 	// expose Server port for interpose controller to connect to (vcsim)
 	// - may want to defer the Server approach
