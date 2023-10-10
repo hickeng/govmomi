@@ -4,18 +4,21 @@ RUN mkdir -p /mnt/shadow-install && tdnf install -y --installroot /mnt/shadow-in
     filesystem toybox python3
 
 # golang:1.18.0-buster amd64
-FROM golang@sha256:7d39537344486528f8cdb3bd8adb98ab7f0f4236044b6944fed8631da35a4ce5 AS golang-build
+FROM golang:1.19 AS interpose-build
 
 WORKDIR /usr/local/go/src/app
 
 ADD . .
-RUN go build app/cmd/interceptor
+RUN go build -o interpose app
+
+RUN mkdir -p /usr/local/go/src/.shadow/{meta,content}
 # TODO: what's the purpose of the temporary temp dir in Dockerfile.vcsim?
 
 FROM scratch
 
+COPY --from=interpose-build /usr/local/go/src/.shadow /
+COPY --from=interpose-build /usr/local/go/src/app/interpose /.shadow/meta/
 COPY --from=rpm-installer / /.shadow/content
-COPY --from=golang-build /usr/local/go/src/app/interceptor /.shadow/meta/
 COPY *.json /.shadow/meta/
 
 #COPY mocks /.shadow/overrides
@@ -36,3 +39,4 @@ COPY *.json /.shadow/meta/
 # provides an easy way to say; this command gets directed back to test harness, run this script, etc.
 #? will this be an issue from a process tree standpoint? Maybe - if necessary, some commands could result in a backflow of logic, whether a socket to use, command to execve with, etc.
 
+CMD /.shadow/content/usr/bin/bash

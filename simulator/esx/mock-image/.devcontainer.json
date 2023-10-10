@@ -1,3 +1,7 @@
 {
-    "build": { "dockerfile": "Dockerfile" }
+    "name": "vcsim-interpose-devcontainer",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": "."
+    }
 }
