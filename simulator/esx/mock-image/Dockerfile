@@ -1,24 +1,40 @@
 FROM photon:5.0  AS rpm-installer
 
-RUN mkdir -p /mnt/shadow-install && tdnf install -y --installroot /mnt/shadow-install/ --releasever=5.0 \
-    filesystem toybox python3
+RUN mkdir -p /mnt/shadow/{base,extras} && tdnf install -y --installroot /mnt/shadow/base --releasever=5.0 filesystem glibc
+RUN tdnf install -y --installroot /mnt/shadow/extras/ --releasever=5.0 toybox
+
 
 # golang:1.18.0-buster amd64
 FROM golang:1.19 AS interpose-build
 
 WORKDIR /usr/local/go/src/app
+RUN go install github.com/go-delve/delve/cmd/dlv@latest
 
 ADD . .
-RUN go build -o interpose app
+RUN go build -o interpose app/cmd/interpose
 
-RUN mkdir -p /usr/local/go/src/.shadow/{meta,content}
-# TODO: what's the purpose of the temporary temp dir in Dockerfile.vcsim?
 
-FROM scratch
 
-COPY --from=interpose-build /usr/local/go/src/.shadow /
+FROM busybox
+#FROM scratch
+
+#TODO: add dlv - we'll want debugging support in the simhost
+
+# copy additional libraries in from extras and set up rtld load path to search them
+COPY --from=rpm-installer /mnt/shadow/extras/ /.shadow/content/
+ENV LD_LIBRARY_PATH=/.shadow/content/lib:/.shadow/content/usr/lib:/.shadow/content/lib64:/.shadow/content/usr/lib64:$LD_LIBRARY_PATH
+
+# glibc/lib needs to match precise versions with ld-linux.so.2 and the absolute path to that is hardcoded into binaries.
+# so we need to have those in the expected abs location for invoking anything from the shadow content
+COPY --from=rpm-installer /mnt/shadow/base/ /
+ENV LD_LIBRARY_PATH=/lib:/usr/lib:/lib64:/usr/lib64:$LD_LIBRARY_PATH
+
+COPY --from=interpose-build /go/bin/dlv /.shadow/content/go/bin/
 COPY --from=interpose-build /usr/local/go/src/app/interpose /.shadow/meta/
-COPY --from=rpm-installer / /.shadow/content
+
+#TODO: replace with symlink/hardlink when shell is available
+COPY --from=interpose-build /usr/local/go/src/app/interpose /usr/bin/toybox
+
 COPY *.json /.shadow/meta/
 
 #COPY mocks /.shadow/overrides
@@ -39,4 +55,6 @@ COPY *.json /.shadow/meta/
 # provides an easy way to say; this command gets directed back to test harness, run this script, etc.
 #? will this be an issue from a process tree standpoint? Maybe - if necessary, some commands could result in a backflow of logic, whether a socket to use, command to execve with, etc.
 
-CMD /.shadow/content/usr/bin/bash
+
+#ENTRYPOINT [ "/bin/toybox" ]
+#CMD [  ]
