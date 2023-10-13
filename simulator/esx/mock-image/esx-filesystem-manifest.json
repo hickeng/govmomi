@@ -1,1 +1,12 @@
-{}
+[
+    {
+        "log": "console",
+        "lddFixup": "true",
+        "targetPrefix": "/.shadow/content",
+
+        "files": [
+            { "invocation": "/usr/bin/toybox", "target": "/usr/bin/toybox" },
+            { "invocation": "/bin/bash", "target": "/bin/bash" }
+        ]
+    }
+]

@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"syscall"
 )
 
 /* Test for how the various options for getting executable behave under hard links/symlinks
@@ -67,11 +68,11 @@ func main() {
 	absDir, _ := filepath.Abs(canonicalizedDir)
 	invocation := fmt.Sprintf("%s/%s", absDir, path.Base(lookPath))
 
-	fmt.Printf("Invocation path: %s", invocation)
+	fmt.Printf("Invocation path: %s\n", invocation)
 
 	// if invoked directly, process flags
 	if absDir == interposeMetaPath {
-		fmt.Printf("Direct invocation of interpose - processing flags")
+		fmt.Printf("Direct invocation of interpose - processing flags\n")
 
 		// - optional - we can just synthesize this through manual symlinks initially
 		// - may be best to defer until home as this part depends on manifest for input
@@ -82,6 +83,33 @@ func main() {
 		flag.String("config", "/.shadow/meta/interceptor-config.json", "Path to the config file")
 
 		flag.Parse()
+
+		path := interposePath + "/content/bin"
+		f, err := os.Open(path)
+		if err != nil {
+			panic(err)
+		}
+
+		fileInfo, err := f.Readdir(-1)
+		f.Close()
+		if err != nil {
+			panic(err)
+		}
+
+		fmt.Println("File Name\t\tSize\t\tIsDir\t\tModified Time")
+		for _, file := range fileInfo {
+			target := ""
+			if file.Mode()&os.ModeSymlink != 0 {
+				linkTarget, err := os.Readlink(filepath.Join(path, file.Name()))
+				if err != nil {
+					panic(err)
+				}
+
+				target = fmt.Sprintf(" -> %s", linkTarget)
+			}
+
+			fmt.Printf("%v%v\n", file.Name(), target)
+		}
 	}
 
 	// expose Server port for interpose controller to connect to (vcsim)
@@ -95,6 +123,15 @@ func main() {
 	// - Server runs in vcsim which is already a continuous presence
 
 	// invoke target per interpose instructions
+	target := filepath.Clean(interposePath + "/content/" + invocation)
+	ldLibraryPath, _ := os.LookupEnv("LD_LIBRARY_PATH")
+	env := append(os.Environ(), "LD_DEBUG=files")
+	fmt.Printf("execing %s with LD_LIBRARY_PATH: %s\n", target, ldLibraryPath)
+
+	execErr := syscall.Exec(target, os.Args, env)
+	if execErr != nil {
+		panic(execErr)
+	}
 
 	os.Exit(0)
 }
