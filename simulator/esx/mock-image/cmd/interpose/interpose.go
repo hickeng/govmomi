@@ -19,10 +19,12 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -56,61 +58,62 @@ There's a quirk where you specify an abs path that goes via a symlink dir - the 
 */
 
 const (
-	interposePath     = "/.shadow"
-	interposeMetaPath = interposePath + "/meta"
+	interposePath        = "/.shadow"
+	interposeMetaPath    = interposePath + "/meta"
+	interposeContentPath = interposePath + "/content"
 )
+
+func cleanInvocationPath(dirty string) string {
+	canonicalizedDir, _ := filepath.EvalSymlinks(path.Dir(dirty))
+	absDir, _ := filepath.Abs(canonicalizedDir)
+	return filepath.Join(absDir, path.Base(dirty))
+}
+
+func directInvocation() {
+	fmt.Printf("Direct invocation of interpose - processing flags\n")
+
+	// - optional - we can just synthesize this through manual symlinks initially
+	// - may be best to defer until home as this part depends on manifest for input
+	// --install --target / --default-source /.shadow/content --override-source /.shadow/overrides --config /.shadow/meta/esx-filesystem-manifest.json
+	flag.Bool("create-reflection", false, "If specified, interceptor will create reflections of source in target as indicated by config")
+	flag.String("target", "/", "Specify the location in which intercepted reflections will be created. Directory path.")
+	flag.String("source", "/.shadow/content", "The location of files to reflect into target. Directory path.")
+	flag.String("config", "/.shadow/meta/interceptor-config.json", "Path to the config file")
+
+	flag.Parse()
+
+	path := interposeContentPath + "/bin"
+	f, err := os.Open(path)
+	if err != nil {
+		panic(err)
+	}
+
+	fileInfo, err := f.Readdir(-1)
+	f.Close()
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println("File Name\t\tSize\t\tIsDir\t\tModified Time")
+	for _, file := range fileInfo {
+		target := ""
+		if file.Mode()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(filepath.Join(path, file.Name()))
+			if err != nil {
+				panic(err)
+			}
+
+			target = fmt.Sprintf(" -> %s", linkTarget)
+		}
+
+		fmt.Printf("%v%v\n", file.Name(), target)
+	}
+}
 
 func main() {
 	// determine normalized invocation path
 	identity := os.Args[0]
 	lookPath, _ := exec.LookPath(identity)
-	canonicalizedDir, _ := filepath.EvalSymlinks(path.Dir(lookPath))
-	absDir, _ := filepath.Abs(canonicalizedDir)
-	invocation := fmt.Sprintf("%s/%s", absDir, path.Base(lookPath))
-
-	fmt.Printf("Invocation path: %s\n", invocation)
-
-	// if invoked directly, process flags
-	if absDir == interposeMetaPath {
-		fmt.Printf("Direct invocation of interpose - processing flags\n")
-
-		// - optional - we can just synthesize this through manual symlinks initially
-		// - may be best to defer until home as this part depends on manifest for input
-		// --install --target / --default-source /.shadow/content --override-source /.shadow/overrides --config /.shadow/meta/esx-filesystem-manifest.json
-		flag.Bool("create-reflection", false, "If specified, interceptor will create reflections of source in target as indicated by config")
-		flag.String("target", "/", "Specify the location in which intercepted reflections will be created. Directory path.")
-		flag.String("source", "/.shadow/content", "The location of files to reflect into target. Directory path.")
-		flag.String("config", "/.shadow/meta/interceptor-config.json", "Path to the config file")
-
-		flag.Parse()
-
-		path := interposePath + "/content/bin"
-		f, err := os.Open(path)
-		if err != nil {
-			panic(err)
-		}
-
-		fileInfo, err := f.Readdir(-1)
-		f.Close()
-		if err != nil {
-			panic(err)
-		}
-
-		fmt.Println("File Name\t\tSize\t\tIsDir\t\tModified Time")
-		for _, file := range fileInfo {
-			target := ""
-			if file.Mode()&os.ModeSymlink != 0 {
-				linkTarget, err := os.Readlink(filepath.Join(path, file.Name()))
-				if err != nil {
-					panic(err)
-				}
-
-				target = fmt.Sprintf(" -> %s", linkTarget)
-			}
-
-			fmt.Printf("%v%v\n", file.Name(), target)
-		}
-	}
 
 	// expose Server port for interpose controller to connect to (vcsim)
 	// - may want to defer the Server approach
@@ -123,10 +126,56 @@ func main() {
 	// - Server runs in vcsim which is already a continuous presence
 
 	// invoke target per interpose instructions
-	target := filepath.Clean(interposePath + "/content/" + invocation)
-	ldLibraryPath, _ := os.LookupEnv("LD_LIBRARY_PATH")
-	env := append(os.Environ(), "LD_DEBUG=files")
-	fmt.Printf("execing %s with LD_LIBRARY_PATH: %s\n", target, ldLibraryPath)
+	//! Remember this is just a hack until we have the manifest providing the actual interprose mapping. Don't go overboard on making it polished.
+
+	invocation := cleanInvocationPath(lookPath)
+	var target string
+	for ; !strings.HasPrefix(target, interposeContentPath); invocation = cleanInvocationPath(target) {
+
+		// fmt.Printf("Invocation path: %s, identity: %s\n", invocation, identity)
+
+		// if invoked directly, process flags
+		if path.Dir(invocation) == interposeMetaPath {
+			directInvocation()
+			break
+		}
+
+		target = filepath.Clean(interposeContentPath + "/" + invocation)
+		fileInfo, err := os.Lstat(target)
+		if err != nil {
+			log.Fatalf("Unable to stat invocation target: %s, %s", target, err)
+		}
+
+		if fileInfo.Mode()&os.ModeSymlink != 0 {
+			// check for recursion otherwise running the following can result in an infinite loop because the shadow content is a symlink back to interprose with the same argv[0]
+			// 		docker run -it --entrypoint=/bin/ls sim-host-dev -l /bin/ls
+
+			// NOTE: we don't bother with full recursive resolution which will involve tracking which names we've seen before.
+			// It's something we can add if we ever find the need. A single layer check should suffice for the interpose->sym-util->sym-toybox->interpose-as-toybox
+			target2, err := os.Readlink(target)
+			if err != nil {
+				log.Fatalf("Unable to determine final invocation from symlink target: %s, %s", target, err)
+			}
+
+			// symlinks are evaled relative to their location unless explicitly absolute.
+			// "target" is abs at this point, so the join will force the target to absolute
+			if !filepath.IsAbs(target2) {
+				target2 = filepath.Join(filepath.Dir(target), target2)
+			}
+
+			// If the target of the symlink is not in the shadow content, then skip one level of links.
+			// This is done so we don't find ourselves invoking interprose with the same argv[0]
+			// As a specific example, instead of seeing /.s/c/bin/ls -> /usr/bin/toybox this will map directly to /.s/c/usr/bin/toybox
+			if !strings.HasPrefix(target2, interposeContentPath) {
+				target = target2
+			}
+		}
+	}
+
+	// ldLibraryPath, _ := os.LookupEnv("LD_LIBRARY_PATH")
+	env := os.Environ()
+	//env = append(env, "LD_DEBUG=files,libs")
+	// fmt.Printf("execing %s with LD_LIBRARY_PATH: %s\n", target, ldLibraryPath)
 
 	execErr := syscall.Exec(target, os.Args, env)
 	if execErr != nil {
