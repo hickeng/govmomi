@@ -3,10 +3,12 @@
         "log": "console",
         "lddFixup": "true",
         "targetPrefix": "/.shadow/content",
+        "mockPrefix": "/.shadow/content", // do we need a separate mock path? Is it useful?
 
         "files": [
             { "invocation": "/usr/bin/toybox", "target": "/usr/bin/toybox" },
-            { "invocation": "/bin/bash", "target": "/bin/bash" }
+            { "invocation": "/bin/bash", "target": "/bin/bash" },
+            { "invocation": "/usr/lib/vmware/infravisor/bin/inf-configstore-cli", "mock": "inf-configstore-cli", "argMatch": ""}
         ]
     }
 ]
