@@ -187,6 +187,36 @@ func TestHostContainerBacking(t *testing.T) {
 	hs.sh.remove(ctx)
 }
 
+func TestHostContainerBackingWithInterpose(t *testing.T) {
+	m := ESX()
+
+	defer m.Remove()
+
+	err := m.Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := SpoofContext()
+
+	hs := NewHostSystem(esx.HostSystem)
+	hs.configureContainerBacking(ctx, "localhost/sim-host-dev", defaultSimVolumes, "vcsim-mgmt-underlay")
+	hs.configureInterpose(ctx, true)
+
+	details, err := hs.getNetConfigInterface(ctx, "management")
+	assert.NoError(t, err, "Expected no error from management netconfig check")
+	assert.Equal(t, "0.0.0.0", details.vmk.Spec.Ip.IpAddress, "Expected IP to be empty prior to container creation")
+
+	hs.configure(ctx, types.HostConnectSpec{}, true)
+
+	assert.NoError(t, err, "Expected no error from management netconfig check")
+	assert.NotEqual(t, "0.0.0.0", details.vmk.Spec.Ip.IpAddress, "Expected management IP to set after container creation")
+
+	// TODO: check that we got the interpose messages we expected to for host bringup
+
+	hs.sh.remove(ctx)
+}
+
 func TestMultipleSimHost(t *testing.T) {
 	m := ESX()
 

@@ -67,7 +67,7 @@ In vcsim, we need interpose to:
 1. Report the pending invocation
 2. Process any registered pre-hooks
 3. Instruct interpose on whether to invoke or return
-3a. If invoking, stream or batch output to test, or keep local
+    1. If invoking, stream or batch output to test, or keep local
 4. Collect exit code and output of invocation
 5. Instruct interpose on what to return
 
@@ -125,6 +125,74 @@ Do we even need local logging and config in interpose? Simplest is to forward ev
 All of the above is image build.
 
 
+### 2024-01-17
+
+On communication between interpose and vcsim. I've settled on not implementing any sort of local interpose configuration for now on the basis that it's an optimization. The critical item to get in place is vcsim being able to return specific data from specific calls.
+
+Given each interpose is a new process invocation I'm going to start with a new connection per interpose.
+The alternative is a shared connection from a mock, whether via a per-mock proxy or via sockets held in shared memory. We may end up down the proxy route by default if/when we get to having a "hostd" per-mock, but that depends on how that's implemented.
+
+For now, each interpose will be a separate connection back to vcsim. This isn't a fully scalable approach, but should suffice for the short & medium term.
+
+As a side-node, I'm going to try to avoid assumptions that the interpose exists within a mock ESXi host. This is because I see utility in being able to mock VCSA for wcpsvc sim testing, which will also require interpose.
+
+Each sim image will need the following injected by vcsim:
+1. vcsim endpoint for callbacks
+1. identifier to report when connecting to vcsim
+
+Each connection will need to identify to vcsim:
+1. origin - identity as injected by vcsim on mock creation
+1. invocation details (target, args, env)
+
+Each interpose response from vcsim will need:
+1. invocation style - we should look at whether it's worth characterizing result handling or just always setting up streams. Archetypes for usage simplicity such as non-interactive interpose could easily be handled by implementation on the vcsim side.
+    1. passthrough - no interpose
+    1. modify invocation - mangle the target/args/env before invocation, set up streams to vcsim
+    1. mock - don't invoke anything, set up streams to vcsim
+1. io streams
+
+#### On gvisor
+[What is gvisor](https://gvisor.dev/docs/) - I looked at gvisor to see whether, instead of writing an interpose layer for execution from scratch, it made sense to jump straight to something where there's full syscall interception options, including for read/write of files.
+
+I opted *not* to proceed with gvisor because of the compounding complexity involved. It's effectively a hypervisor presenting a Linux ABI instead of an x86 ISA. That means there's a _lot_ of complexity to achieve what I'm after - aspect style interpose of exec and file read/write calls, nothing more. Additionally, gvisor doesn't appear to provide any sort of aspect style interpose framework so all the implementation needed for a from scratch interprose is still required, albeit with a potentially easier path for read/write intercept.
+
+#### On ptrace
+Ptrace works for our purpose... but only if there's a means of launching all executables as a ptrace child immediately. That entails either modification of the target binaries... or interpose of a launcher to act as the ptrace parent. As such this doesn't simplify life at all... but may be useful when looking at intercepting read/write calls. For read/write this needs to be compared against setups such as having the mutable container layer be a 9p mount talking to vcsim.
+
+#### On bpftrace
+[arch man page for bpftrace](https://man.archlinux.org/man/extra/bpftrace/bpftrace.8.en) - this seems like it _might_ be a reasonable candidate for an exec hook.
+
+It would need to be able to rewrite the target executable to be an rpc proxy, but that would neatly avoid having to install `interpose` binary all through the filesystem.
+
+At the most basic level, we'd intercept _all_ execs, maybe matching coarse patterns of location in filesystem, and forward them all to the proxy that would relay to vcsim.
+
+#### On HTTP/3
+
+Not currently supported in Go.
+
+#### On HTTP/2
+
+[non-TLS impl ](https://pkg.go.dev/golang.org/x/net/http2/h2c) which isn't present in net/http.
+
+#### On grpc/protobuf
+
+[protobuf](https://protobuf.dev/overview/) - this would be a great match, but requires an additional build step which is a non-trivial increment in complexity given we've lots of users who use vcsim just via `go build` or `go test`.
+
+### 2024-01-18
+
+Spoke to @dougm and have settled on using embedded SSH. It already supports multiplexing of binary streams along with control channel, connection identification and all the rest of the mechanics that are needed.
+
+In part it's such a good match because it's already about shell interactions and binary invocation, and that's what we're trying to intercept/redirect.
+
+* [x] look into gvisor or similar for full system call intercept capabilities within a container
+    * commentary added to notes from 2024-01-17
+* [x] look at HTTP/2 or 3 instead of ssh for multiplexed streams
+    * does not have a standard library impl for HTTP3 currently and it doesn't look like you can protocol upgrade a stream, only the entire connection. That means we need to do encoding for binary content which pushes the complexity too high to be worthwhile.
+
+
+### 2024-01-22
+
+Proceeding to add embedded SSH to vcsim/mock image.
 
 ## Notes
 

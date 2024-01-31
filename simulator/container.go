@@ -27,6 +27,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path"
@@ -72,6 +73,8 @@ type container struct {
 
 	cancelWatch context.CancelFunc
 	changes     chan struct{}
+
+	interpose bool
 }
 
 type networkSettings struct {
@@ -194,6 +197,38 @@ func copyFromGuest(id string, src string, sink func(int64, io.Reader) error) err
 	return nil
 }
 
+// writeFile
+//   - will write contents as a file in the container filesystem
+//   - will work when container is not running
+//   - will NOT work for special files such as DMI or /proc, and /sys - see copyToGuest for those usecases
+func writeFile(cid string, path string, content []byte) error {
+	if cid == "" {
+		return uninitializedContainer(errors.New("write into uninitialized container"))
+	}
+
+	tempFile, err := os.CreateTemp("", "vcsim-container-cp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tempFile.Name())
+
+	n, err := tempFile.Write(content)
+	if err != nil {
+		return err
+	}
+	if n != len(content) {
+		return fmt.Errorf("failed to write full content to %s - wrote %d of %d", tempFile.Name(), n, len(content))
+	}
+
+	cmd := exec.Command("docker", "cp", tempFile.Name(), fmt.Sprintf("%s:%s", cid, path))
+	err = cmd.Run()
+	if err != nil {
+		log.Printf("%s %s: %s", cid, cmd.Args, err)
+	}
+
+	return err
+}
+
 // createVolume creates a volume populated with the provided files
 // If the header.Size is omitted or set to zero, then len(content+1) is used.
 // Docker appears to treat this volume create command as idempotent so long as it's identical
@@ -287,6 +322,40 @@ func createVolume(volumeName string, labels []string, files []tarEntry) (string,
 	}
 
 	return uid, err
+}
+
+var bridgeNames = []string{"docker0", "podman0"}
+
+// getBridgeAddr retrieves the IP of the bridge NIC on the host. This can then be used to determine
+// an IP on the host that can route to the bridge to bind against for servers.
+func getBridgeAddr() (netip.Addr, error) {
+	var nif *net.Interface
+	var name string
+	var err error
+	for _, name = range bridgeNames {
+		if nif, err = net.InterfaceByName(name); err == nil {
+			break
+		}
+	}
+
+	if nif == nil {
+		return netip.Addr{}, errors.New("unable to determine container bridge interface")
+	}
+
+	addrs, err := nif.Addrs()
+	if err != nil {
+		return netip.Addr{}, errors.New("unable to retrieve addresses for bridge interface")
+	}
+
+	for _, addr := range addrs {
+		ipnet, _ := addr.(*net.IPNet)
+		ip, ok := netip.AddrFromSlice(ipnet.IP)
+		if ok {
+			return ip.Unmap(), nil
+		}
+	}
+
+	return netip.Addr{}, fmt.Errorf("no ipv4 address on interface %s", name)
 }
 
 func getBridge(bridgeName string) (string, error) {
@@ -503,6 +572,10 @@ func (c *container) start(ctx *Context) error {
 		return uninitializedContainer(errors.New("start of uninitialized container"))
 	}
 
+	if c.interpose {
+		globalInterposeServer.registerContainerForInterpose(ctx, c)
+	}
+
 	start := "start"
 	_, detail, err := c.inspect()
 	if err != nil {
@@ -536,6 +609,8 @@ func (c *container) pause(ctx *Context) error {
 	err := cmd.Run()
 	if err != nil {
 		log.Printf("%s %s: %s", c.name, cmd.Args, err)
+	} else {
+		globalInterposeServer.unregisterContainerForInterpose(ctx, c)
 	}
 
 	return err
@@ -555,6 +630,8 @@ func (c *container) restart(ctx *Context) error {
 	err := cmd.Run()
 	if err != nil {
 		log.Printf("%s %s: %s", c.name, cmd.Args, err)
+	} else {
+		globalInterposeServer.unregisterContainerForInterpose(ctx, c)
 	}
 
 	return err
@@ -574,6 +651,8 @@ func (c *container) stop(ctx *Context) error {
 	err := cmd.Run()
 	if err != nil {
 		log.Printf("%s %s: %s", c.name, cmd.Args, err)
+	} else {
+		globalInterposeServer.unregisterContainerForInterpose(ctx, c)
 	}
 
 	return err
@@ -619,6 +698,8 @@ func (c *container) remove(ctx *Context) error {
 		// consider absence success
 		return nil
 	}
+
+	globalInterposeServer.unregisterContainerForInterpose(ctx, c)
 
 	cmd := exec.Command("docker", "rm", "-v", "-f", c.id)
 	err := cmd.Run()
@@ -702,7 +783,7 @@ func (c *container) watchContainer(ctx context.Context, updateFn func(*container
 	defer c.Unlock()
 
 	if c.id == "" {
-		return uninitializedContainer(errors.New("Attempt to watch uninitialized container"))
+		return uninitializedContainer(errors.New("attempt to watch uninitialized container"))
 	}
 
 	eventWatch.watch(c)

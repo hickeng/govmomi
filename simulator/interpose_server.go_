@@ -1,0 +1,206 @@
+/*
+Copyright (c) 2023-2023 VMware, Inc. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+package simulator
+
+import (
+	"context"
+	"net"
+	"sync"
+	"regexp"
+
+	"golang.org/x/crypto/ssh"
+)
+
+// Syscalls is a collection of basis syscall types that we want to be able to intercept.
+type Syscalls struct {
+	Execute
+	Read
+	Write
+	Create
+	Open
+	Delete
+}
+
+const (
+	PASSTHROUGH InterposeStyle = iota
+	MODIFY_INVOCATION_AND_PASSTHROUGH_RESULT
+	MOCK_EMBED_RESULT
+	MOCK_INTERACTIVE_RESULT
+	// We can add a modify/interactive result at a later date. It's more involved as it's either disruptive to the process tree
+	// or requires creating a sidecar style mechanism (probably via ptrace) to interpose stdio/signals/etc.
+)
+
+type Invocation struct {
+	// Runtime provides identifiers for the runtime environment the invocation is occuring in.
+	// In practice this means a container in the simulator, but presenting a map of IDs allows
+	// us to provide a mix of different domain identifiers, eg. moid, containerID, IP address,
+	// MAC addresses, etc... all of which can be convenient for lookup in different contexts.
+	RuntimeIDs map[string]string
+
+	// Target executable
+	Target string
+	Args []string
+	Env []string
+	// Pwd is included because it's critical context for commonly used calls and not necessarily present in Env
+	Pwd string
+
+	// User string
+	// Groups []string
+
+	// Pid uint
+	// Pgid uint
+}
+
+
+type InterposeDirective struct {
+	// InterposeStyle determines how the interpose occurs
+	Style InterposeStyle
+
+	// Invocation is embedded because we need to return exactly the same set of, potentially modified or mocked, data.
+	// This is ignored if Style is PASSTHROUGH
+	Invocation Invocation
+
+	// EmbeddedResult applies if using MOCK_EMBED_RESULT style. It is included in the invocation directive so only a single
+	// message is needed in that scenario.
+	EmbeddedResult *struct {
+		// Output is the mocked output for a command. The array will be processed in order with stdout written out followed by
+		// stderr before repeating with the next element. This is done to allow very basic synchronization of output between the
+		// streams. May be zero length.
+		Output []struct{
+			Stdout string
+			Stderr string
+		}
+
+		ExitCode int
+	}
+	// TODO: look at whether it's useful to add nice values, mem/cpu limits, etc.
+}
+
+
+
+type InterposeCallback func(*Invocation)
+type Interpose interface {
+
+
+}
+
+// type interposeServer struct {
+// 	sync.Mutex
+
+// 	addr			net.Addr
+// 	clientsOfRecord map[string]*ssh.ServerConn
+// 	sshServer       *ssh.ServerConn
+// 	config          *ssh.ServerConfig
+// 	socket          net.Listener
+// }
+
+func newInterposeServer(ctx context.Context, port int) (*interposeServer, error) {
+	server := &interposeServer{}
+	// TODO: add configurability for host interpose port
+	server.addr = &net.TCPAddr{
+		IP: net.ParseIP("0.0.0.0"),
+		Port: 9999,
+	}
+
+	return server, nil
+}
+
+func (s *interposeServer) registerClient(id string) {
+	s.Lock()
+	clientCount := len(s.clientsOfRecord)
+
+	if client, present := s.clientsOfRecord[id]; present && client != client {
+		panic("must not register a new client with the same id without unregistering first")
+	}
+	s.clientsOfRecord[id] = nil
+	s.Unlock()
+
+	if clientCount == 0 && s.socket == nil {
+		err := s.serve()
+		if err != nil {
+			panic("unable to start server for host interpose")
+		}
+	}
+}
+
+func (s *interposeServer) unregisterClient(id string) {
+	s.Lock()
+	client := s.clientsOfRecord[id]
+	delete(s.clientsOfRecord, id)
+
+	if client != nil {
+		client.Close()
+	}
+	if len(s.clientsOfRecord) == 0 {
+		// error is non-fatal for stopping the server as this is only an optimization
+		err := s.socket.Close()
+		if err == nil {
+			s.socket = nil
+		}
+	}
+
+	s.Unlock()
+
+	return
+}
+
+
+
+func (s *interposeServer) serve(addr net.Addr, port int) error {
+	wg := sync.WaitGroup(1)
+	var err error
+
+	go func() {
+		for {
+			s.Lock()
+			if s.socket != nil {
+				s.socket.Close()
+			}
+
+			s.socket, err = net.Listen(addr.Network(), addr.String())
+			if err != nil {
+				// TODO: add error handling/logging for attempts after the first
+				panic("unable to listen for host interpose")
+			}
+
+			wg.Done()
+
+			for s.socket != nil {
+				conn, err := socket.Accept()
+				if err != nil {
+					//TODO:
+				}
+
+				go func() {
+					sshConn, chans, reqs, err := ssh.NewServerConn(conn, s.config)
+					if err != nil {
+						// TODO:
+						panic("unable to create ssh server on connection %+v: %s", conn, err)
+					}
+					interposeHandler(sshConn, chans, reqs)
+				}()
+			}
+		}
+	}()
+
+	wg.Wait()
+	return nil
+
+}
+
+
+interposeHandler(conn *ServerConn, channels <-chan NewChannel, requests <-chan *Request) {
+}

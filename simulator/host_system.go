@@ -143,6 +143,21 @@ func (h *HostSystem) configure(ctx *Context, spec types.HostConnectSpec, connect
 	}
 }
 
+func (h *HostSystem) configureInterpose(ctx *Context, enabled bool) error {
+	option := &types.OptionValue{
+		Key:   advOptContainerBackingInterpose,
+		Value: enabled,
+	}
+
+	advOpts := ctx.Map.Get(h.ConfigManager.AdvancedOption.Reference()).(*OptionManager)
+	fault := advOpts.UpdateOptions(&types.UpdateOptions{ChangedValue: []types.BaseOptionValue{option}}).Fault()
+	if fault != nil {
+		panic(fault)
+	}
+
+	return nil
+}
+
 // configureContainerBacking sets up _this_ host for simulation using a container backing.
 // Args:
 //

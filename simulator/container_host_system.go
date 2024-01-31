@@ -28,12 +28,15 @@ import (
 const (
 	advOptPrefixPnicToUnderlayPrefix = "RUN.underlay."
 	advOptContainerBackingImage      = "RUN.container"
+	advOptContainerBackingInterpose  = "RUN.interpose"
 	defaultUnderlayBridgeName        = "vcsim-underlay"
 )
 
 type simHost struct {
 	host *HostSystem
 	c    *container
+
+	interpose bool
 }
 
 // createSimHostMounts iterates over the provide filesystem mount info, creating docker volumes. It does _not_ delete volumes
@@ -160,7 +163,7 @@ func getPnicUnderlay(advOpts *OptionManager, pnicName string) string {
 	return queryRes.Returnval[0].GetOptionValue().Value.(string)
 }
 
-// createSimulationHostcreates a simHost binding if the host.ConfigManager.AdvancedOption set contains a key "RUN.container".
+// createSimulationHost creates a simHost binding if the host.ConfigManager.AdvancedOption set contains a key "RUN.container".
 // If the set does not contain that key, this returns nil.
 // Methods on the simHost type are written to check for nil object so the return from this call can be blindly
 // assigned and invoked without the caller caring about whether a binding for a backing container was warranted.
@@ -178,16 +181,30 @@ func getPnicUnderlay(advOpts *OptionManager, pnicName string) string {
 // * no support for mocking VLANs
 func createSimulationHost(ctx *Context, host *HostSystem) (*simHost, error) {
 	sh := &simHost{
-		host: host,
+		host:      host,
+		interpose: false,
 	}
 
 	advOpts := ctx.Map.Get(host.ConfigManager.AdvancedOption.Reference()).(*OptionManager)
-	fault := advOpts.QueryOptions(&types.QueryOptions{Name: "RUN.container"}).(*methods.QueryOptionsBody).Fault()
+
+	body := advOpts.QueryOptions(&types.QueryOptions{Name: advOptContainerBackingImage}).(*methods.QueryOptionsBody)
+	fault := body.Fault()
 	if fault != nil {
 		if _, ok := fault.VimFault().(*types.InvalidName); ok {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("errror retrieving container backing from host config manager: %+v", fault.VimFault())
+		return nil, fmt.Errorf("error retrieving container backing from host config manager: %+v", fault.VimFault())
+	}
+	image := body.Res.Returnval[0].GetOptionValue().Value.(string)
+
+	body = advOpts.QueryOptions(&types.QueryOptions{Name: advOptContainerBackingInterpose}).(*methods.QueryOptionsBody)
+	fault = body.Fault()
+	if fault != nil {
+		if _, ok := fault.VimFault().(*types.InvalidName); !ok {
+			return nil, fmt.Errorf("error retrieving container interpose config from host config manager: %+v", fault.VimFault())
+		}
+	} else {
+		sh.interpose = body.Res.Returnval[0].GetOptionValue().Value.(bool)
 	}
 
 	// assemble env
@@ -216,9 +233,13 @@ func createSimulationHost(ctx *Context, host *HostSystem) (*simHost, error) {
 	execCmds = append(execCmds, netCmds...)
 
 	// create the container
-	sh.c, err = create(ctx, hName, hUuid, dockerNet, dockerVol, nil, dockerEnv, "alpine", []string{"sleep", "infinity"})
+	sh.c, err = create(ctx, hName, hUuid, dockerNet, dockerVol, nil, dockerEnv, image, []string{"sleep", "2073600"})
 	if err != nil {
 		return nil, err
+	}
+
+	if sh.interpose {
+		globalInterposeServer.registerContainerForInterpose(ctx, sh.c)
 	}
 
 	// start the container
