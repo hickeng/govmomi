@@ -72,6 +72,21 @@ func cleanInvocationPath(dirty string) string {
 	return filepath.Join(absDir, path.Base(dirty))
 }
 
+var logging = os.Getenv("VCSIM_INTERPOSE_DEBUG_LOGS") != ""
+
+func console(msg string, extra ...any) {
+	if !logging {
+		return
+	}
+
+	msg = strings.TrimSuffix(msg, "\n")
+	if len(extra) == 0 {
+		fmt.Println(msg)
+	}
+
+	fmt.Printf(msg+"\n", extra...)
+}
+
 func directInvocation() {
 	fmt.Printf("Direct invocation of interpose - processing flags\n")
 
@@ -97,7 +112,7 @@ func directInvocation() {
 		panic(err)
 	}
 
-	fmt.Println("File Name\t\tSize\t\tIsDir\t\tModified Time")
+	console("File Name\t\tSize\t\tIsDir\t\tModified Time")
 	for _, file := range fileInfo {
 		target := ""
 		if file.Mode()&os.ModeSymlink != 0 {
@@ -109,7 +124,7 @@ func directInvocation() {
 			target = fmt.Sprintf(" -> %s", linkTarget)
 		}
 
-		fmt.Printf("%v%v\n", file.Name(), target)
+		console("%v%v\n", file.Name(), target)
 	}
 }
 
@@ -135,7 +150,7 @@ func Interpose(exe string, args []string, env []string, pwd string) {
 	var target string
 	for ; !strings.HasPrefix(target, InterposeContentPath); invocation = cleanInvocationPath(target) {
 
-		fmt.Printf("Invocation path: %s, identity: %s\n", invocation, identity)
+		console("Invocation path: %s, identity: %s", invocation, identity)
 
 		// if invoked directly, process flags
 		if path.Dir(invocation) == InterposeMetaPath {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/netip"
 	"os"
@@ -51,7 +50,7 @@ func newClient(ctx context.Context, target string, args []string, env []string, 
 	}
 
 	// create the SSH client from the mocked connection
-	fmt.Printf("connecting to interpose server at %s\n", remote)
+	console("connecting to interpose server at %s", remote)
 	// TODO: make the timeout part of the config file so the server can determine its own latency
 	// config.Timeout = 3 * time.Second
 	client, err := ssh.Dial("tcp", remote, config)
@@ -77,7 +76,7 @@ func newClient(ctx context.Context, target string, args []string, env []string, 
 			}
 
 			if terr.Reason == ssh.Prohibited && terr.Message == string(PASSTHROUGH) {
-				fmt.Printf("pass-through %s\n", target)
+				console("pass-through %s", target)
 				return PASSTHROUGH, nil, nil
 			}
 
@@ -87,7 +86,7 @@ func newClient(ctx context.Context, target string, args []string, env []string, 
 		}
 	}
 
-	fmt.Printf("non pass-through %s\n", target)
+	console("non pass-through %s", target)
 
 	defer chans.Close()
 	defer client.Close()
@@ -96,7 +95,7 @@ func newClient(ctx context.Context, target string, args []string, env []string, 
 	wg.Add(1)
 	go func() {
 		for msg := range reqs {
-			log.Printf("received request: %+v", msg)
+			console("received request: %+v", msg)
 		}
 	}()
 
