@@ -412,7 +412,7 @@ func (svm *simVM) exec(ctx *Context, auth types.BaseGuestAuthentication, args []
 		return "", fault
 	}
 
-	out, err := svm.c.exec(ctx, args)
+	out, err := svm.c.exec(ctx, args, nil)
 	if err != nil {
 		log.Printf("%s: %s (%s)", svm.vm.Name, args, string(out))
 		return "", new(types.GuestOperationsFault)

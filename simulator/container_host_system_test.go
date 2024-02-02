@@ -212,6 +212,24 @@ func TestHostContainerBackingWithInterpose(t *testing.T) {
 	assert.NoError(t, err, "Expected no error from management netconfig check")
 	assert.NotEqual(t, "0.0.0.0", details.vmk.Spec.Ip.IpAddress, "Expected management IP to set after container creation")
 
+	// sanity check a command can run on the host
+	output, err := hs.sh.exec(ctx, "date")
+	assert.Nil(t, err, "expected to be able to execute commands in sim host")
+	assert.NotEmpty(t, output, "expected timestamp")
+
+	// install an interpose handler
+	// TODO: return IP from spec for IP address via esxcli
+
+	output, err = hs.sh.exec(ctx, "esxcli", "network", "ip", "get")
+	assert.Nil(t, err, "expected to be able to execute commands in sim host")
+	assert.Equal(t, output, details.vmk.Spec.Ip.IpAddress, "expected IP address from command to match with spec")
+
+	// confirm the handler fired and the execution reflected that
+
+	// get record of all interposed invocations from host
+
+	// confirm record contains interposed call
+
 	// TODO: check that we got the interpose messages we expected to for host bringup
 
 	hs.sh.remove(ctx)

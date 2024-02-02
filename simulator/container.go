@@ -97,6 +97,7 @@ type containerDetails struct {
 
 type unknownContainer error
 type uninitializedContainer error
+type backingConfigurationMissing error
 
 var sanitizeNameRx = regexp.MustCompile(`[\(\)\s]`)
 
@@ -665,7 +666,7 @@ func (c *container) stop(ctx *Context) error {
 //	 err
 //			* uninitializedContainer error - if c.id is empty
 //		   	* err from cmd execution
-func (c *container) exec(ctx *Context, args []string) (string, error) {
+func (c *container) exec(ctx *Context, args []string, opts []string) (string, error) {
 	c.Lock()
 	id := c.id
 	c.Unlock()
@@ -674,8 +675,10 @@ func (c *container) exec(ctx *Context, args []string) (string, error) {
 		return "", uninitializedContainer(errors.New("exec into uninitialized container"))
 	}
 
-	args = append([]string{"exec", c.id}, args...)
-	cmd := exec.Command("docker", args...)
+	execArgs := append([]string{"exec"}, opts...)
+	execArgs = append(execArgs, c.id)
+	execArgs = append(execArgs, args...)
+	cmd := exec.Command("docker", execArgs...)
 	res, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Printf("%s: %s (%s)", c.name, cmd.Args, string(res))

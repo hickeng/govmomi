@@ -17,6 +17,7 @@ limitations under the License.
 package simulator
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -250,7 +251,7 @@ func createSimulationHost(ctx *Context, host *HostSystem) (*simHost, error) {
 
 	// run post-creation steps
 	for _, cmd := range execCmds {
-		_, err := sh.c.exec(ctx, cmd)
+		_, err := sh.c.exec(ctx, cmd, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -284,6 +285,35 @@ func createSimulationHost(ctx *Context, host *HostSystem) (*simHost, error) {
 	netconfig.vmk.Spec.Mac = netconfig.uplink.Mac
 
 	return sh, nil
+}
+
+func (sh *simHost) exec(ctx *Context, cmd ...string) (string, error) {
+	return sh.execAdv(ctx, cmd[0], cmd[1:], nil, nil)
+}
+
+// execAdv returns the combined stdout+stderr of the specified process after execution by the simulated host
+// target - the path of the binary to execute
+// args - arguments to supply to the executable
+// env - environment variables to set. This is translated into docker --env options so the behaviour regarding default values inherits from that.
+// opts - allows passing of arbitrary options to docker exec, eg. -wdir to specify working directory for the command
+func (sh *simHost) execAdv(ctx *Context, target string, args []string, env []string, opts []string) (string, error) {
+	if sh == nil {
+		return "", nil
+	}
+
+	if sh.c == nil {
+		return "", unknownContainer(errors.New("unable to exec due to missing container backing"))
+	}
+
+	cmd := append([]string{target}, args...)
+
+	execOpts := make([]string, 0, 2*len(env)+len(opts))
+	for i := range env {
+		execOpts = append(execOpts, "--env", env[i])
+	}
+	execOpts = append(execOpts, opts...)
+
+	return sh.c.exec(ctx, cmd, execOpts)
 }
 
 // remove destroys the container associated with the host and any volumes with labels specifying their lifecycle

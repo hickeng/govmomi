@@ -63,7 +63,7 @@ RUN [ "/bin/ln", "-s", "/.shadow/meta/interpose", "/bin/sh" ]
 # TODO: figure out which of these is needed after manifest is in place.
 # This pivots the "ln" from being a hardlink to a symlink after it's been used to place the interpose binary
 # Wouldn't bother but inspecting inodes shows that hardlinks are being broken by the Dockerbuild layers for some reason
-RUN for i in /usr/bin/{ln,mkdir,ls,toybox,du,rm,sleep,}; do ln -sf /.shadow/meta/interpose $i;done
+RUN for i in /usr/bin/{ln,mkdir,ls,toybox,du,rm,sleep,date}; do ln -sf /.shadow/meta/interpose $i;done
 
 COPY simulator/esx/mock-image/*.json /.shadow/meta/
 

@@ -17,6 +17,7 @@ limitations under the License.
 package simulator
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -144,13 +145,28 @@ func (h *HostSystem) configure(ctx *Context, spec types.HostConnectSpec, connect
 }
 
 func (h *HostSystem) configureInterpose(ctx *Context, enabled bool) error {
+	advOpts := ctx.Map.Get(h.ConfigManager.AdvancedOption.Reference()).(*OptionManager)
+
+	// confirm there's a container backing to work with
+	// don't bother confirming interpose support in the image at this point - let that fail at point of use as:
+	// 1. it's a pain to check here given it, at a minimum, requires image metadata
+	// 2. tests could inject interpose binaries dynamically
+	body := advOpts.QueryOptions(&types.QueryOptions{Name: advOptContainerBackingImage}).(*methods.QueryOptionsBody)
+	fault := body.Fault()
+	if fault != nil {
+		if _, ok := fault.VimFault().(*types.InvalidName); ok {
+			return backingConfigurationMissing(errors.New("interpose requires a container backing"))
+		}
+
+		return fmt.Errorf("error retrieving container backing from host config manager: %+v", fault.VimFault())
+	}
+
 	option := &types.OptionValue{
 		Key:   advOptContainerBackingInterpose,
 		Value: enabled,
 	}
 
-	advOpts := ctx.Map.Get(h.ConfigManager.AdvancedOption.Reference()).(*OptionManager)
-	fault := advOpts.UpdateOptions(&types.UpdateOptions{ChangedValue: []types.BaseOptionValue{option}}).Fault()
+	fault = advOpts.UpdateOptions(&types.UpdateOptions{ChangedValue: []types.BaseOptionValue{option}}).Fault()
 	if fault != nil {
 		panic(fault)
 	}
