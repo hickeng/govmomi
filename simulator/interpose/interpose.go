@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2023-2023 VMware, Inc. All Rights Reserved.
+Copyright (c) 2023-2024 VMware, Inc. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,8 +18,10 @@ package interpose
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -161,7 +163,11 @@ func Interpose(exe string, args []string, env []string, pwd string) {
 		target = filepath.Clean(InterposeContentPath + "/" + invocation)
 		fileInfo, err := os.Lstat(target)
 		if err != nil {
-			log.Fatalf("Unable to stat invocation target: %s, %s", target, err)
+			console("Unable to stat invocation target: %s, %s", target, err)
+
+			// return the target anyway as remote interpose might want to process it anyway
+			target = invocation
+			break
 		}
 
 		if fileInfo.Mode()&os.ModeSymlink != 0 {
@@ -194,7 +200,15 @@ func Interpose(exe string, args []string, env []string, pwd string) {
 	//env = append(env, "LD_DEBUG=files,libs")
 	//fmt.Printf("execing %s with LD_LIBRARY_PATH: %s\n", target, ldLibraryPath)
 
-	style, session, err := newClient(context.Background(), target, args, env, pwd)
+	bytes, err := os.ReadFile(interposeClientConfigPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			panic(fmt.Sprintf("failed to open client config file %s: %s", interposeClientConfigPath, err))
+		}
+	}
+	ctx := context.WithValue(context.Background(), configCtxKey, bytes)
+
+	style, result, err := newClient(ctx, target, args, env, pwd)
 	if err != nil {
 		panic(err)
 	}
@@ -208,13 +222,23 @@ func Interpose(exe string, args []string, env []string, pwd string) {
 		// cannot reach here
 	}
 
-	// remote
-	_ = session
-	// TODO: relay stdin to remote
-	// TODO: capture signals to relay to remote
-	// TODO: relay stdout to caller
-	// TODO: relay stderr to caller
+	if style == STATIC {
+		io.Copy(os.Stdout, result.stdout())
+		io.Copy(os.Stderr, result.stderr())
 
-	// TODO: get exit code from remote
-	os.Exit(0)
+		os.Exit(int(result.exitCode()))
+	}
+
+	if style == REMOTE {
+		// remote
+		// TODO: relay stdin to remote
+		// TODO: capture signals to relay to remote
+		// TODO: relay stdout to caller
+		// TODO: relay stderr to caller
+		// TODO: get exit code from remote
+
+		panic("remote redirect unimplemented")
+	}
+
+	panic(fmt.Sprintf("unknown style type: %+v", style))
 }

@@ -56,7 +56,7 @@ func genKey() []byte {
 // NewServer
 // An SSH server is represented by a ServerConfig, which holds certificate details and handles authentication of ServerConns.
 // In the case of interpose we don't care about security in the slightest so we abuse this to avoid overhead.
-func NewServer(addr netip.Addr) (*Server, error) {
+func NewServer(addr netip.Addr, handlers *Handlers) (*Server, error) {
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	server := &Server{
@@ -130,9 +130,39 @@ func NewServer(addr netip.Addr) (*Server, error) {
 
 					log.Printf("Invocation: extradata: %d, remote: %+v, target: %s, args: %+v, env: %+v", len(data), invocation.RuntimeIDs, invocation.Target, invocation.Args, invocation.Env)
 
-					err = newChannel.Reject(ssh.Prohibited, string(PASSTHROUGH))
-					if err != nil {
-						panic("Failed to direct remote to a pass-through invocation")
+					registered, id, msg := handlers.processInvocation(invocation)
+					if registered {
+						log.Printf("Processed by handler %+s", id)
+					} else {
+						log.Printf("Processed by fallback")
+					}
+
+					switch action := msg.(type) {
+					case *PassThrough:
+						err = newChannel.Reject(ssh.Prohibited, string(PASSTHROUGH))
+						log.Printf("Pass-through")
+						if err != nil {
+							panic("Failed to direct remote to a pass-through invocation")
+						}
+
+					case *Static:
+						chans, reqs, err := newChannel.Accept()
+						if err != nil {
+							log.Fatalf("error accepting channel for interpose request: %s", err)
+						}
+
+						_, err = chans.SendRequest(string(STATIC), false, action.Marshal())
+						if err != nil {
+							log.Fatalf("error from static interpose request: %s", err)
+						}
+
+						go ssh.DiscardRequests(reqs)
+						chans.Close()
+
+					case *Remote:
+						panic("unimplemented")
+					default:
+						panic("unknown type of interpose response")
 					}
 				}
 			}()
