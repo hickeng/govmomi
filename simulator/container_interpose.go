@@ -15,8 +15,9 @@ var globalInterposeServer = &interposeServer{}
 type interposeServer struct {
 	sync.Mutex
 
-	remotes map[string]*container
-	server  *interpose.Server
+	remotes  map[string]*container
+	server   *interpose.Server
+	handlers interpose.Handlers
 }
 
 func (is *interposeServer) registerContainerForInterpose(ctx *Context, c *container) {
@@ -66,7 +67,6 @@ func (is *interposeServer) unregisterContainerForInterpose(ctx *Context, c *cont
 // start will attempt (and fail) to create a UDP connection to the IPv4 associated with the container runtime
 // bridge. The source IP of this connection is therefore a suitable local IP for hosting a server to expose to
 // containers.
-// ?? for follow up -current testing shows it returning the bridge IP itself.. which is odd, but maybe not an issue.
 func (is *interposeServer) start() error {
 	serverAddr := netip.MustParseAddr("0.0.0.0")
 
@@ -91,7 +91,7 @@ func (is *interposeServer) start() error {
 		}
 	}
 
-	is.server, _ = interpose.NewServer(serverAddr)
+	is.server, _ = interpose.NewServer(serverAddr, &is.handlers)
 	return nil
 }
 

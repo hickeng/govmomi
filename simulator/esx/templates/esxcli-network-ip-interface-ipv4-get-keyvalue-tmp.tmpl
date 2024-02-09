@@ -1,0 +1,9 @@
+{{ range $index, $element := . }}
+structure[{{ $index }}].IPv4Interface.AddressType.string={{ if $element.DHCPAddress }}DHCP{{ else }}Static{{ end }}
+structure[{{ $index }}].IPv4Interface.DHCPDNS.boolean={{ $element.DHCPDNS }}
+structure[{{ $index }}].IPv4Interface.Gateway.string={{ $element.Gateway }}
+structure[{{ $index }}].IPv4Interface.IPv4Address.string={{ $element.IPv4Address }}
+structure[{{ $index }}].IPv4Interface.IPv4Broadcast.string={{ $element.IPv4Broadcast }}
+structure[{{ $index }}].IPv4Interface.IPv4Netmask.string={{ $element.IPv4Netmask }}
+structure[{{ $index }}].IPv4Interface.Name.string={{ $element.Name }}
+{{ end }}

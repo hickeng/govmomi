@@ -65,6 +65,9 @@ RUN [ "/bin/ln", "-s", "/.shadow/meta/interpose", "/bin/sh" ]
 # Wouldn't bother but inspecting inodes shows that hardlinks are being broken by the Dockerbuild layers for some reason
 RUN for i in /usr/bin/{ln,mkdir,ls,toybox,du,rm,sleep,date}; do ln -sf /.shadow/meta/interpose $i;done
 
+# TODO: temp hack to test interpose handler
+RUN ln -sf /.shadow/meta/interpose /bin/esxcli
+
 COPY simulator/esx/mock-image/*.json /.shadow/meta/
 
 

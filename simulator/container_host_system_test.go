@@ -17,12 +17,19 @@ limitations under the License.
 package simulator
 
 import (
+	"bytes"
+	"net"
+	"os"
+	"path"
+	"strings"
 	"testing"
+	"text/template"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/vmware/govmomi/simulator/esx"
+	"github.com/vmware/govmomi/simulator/interpose"
 	"github.com/vmware/govmomi/vim25/methods"
 	"github.com/vmware/govmomi/vim25/types"
 )
@@ -217,18 +224,98 @@ func TestHostContainerBackingWithInterpose(t *testing.T) {
 	assert.Nil(t, err, "expected to be able to execute commands in sim host")
 	assert.NotEmpty(t, output, "expected timestamp")
 
-	// install an interpose handler
-	// TODO: return IP from spec for IP address via esxcli
+	pwd, _ := os.Getwd()
+	_ = pwd
+	tmpl, err := template.New("esxcli-network-ip-interface-ipv4-get-keyvalue.tmpl").ParseFiles("esx/templates/esxcli-network-ip-interface-ipv4-get-keyvalue.tmpl")
+	require.Nil(t, err, "expected to cleanly load template")
 
-	output, err = hs.sh.exec(ctx, "esxcli", "network", "ip", "get")
+	type esxcli struct {
+		Name          string
+		DHCPAddress   bool
+		DHCPDNS       bool
+		Gateway       string
+		IPv4Address   string
+		IPv4Broadcast string
+		IPv4Netmask   string
+	}
+
+	invocation := []string{
+		"esxcli",
+		"--formatter=keyvalue",
+		"network",
+		"ip",
+		"interface",
+		"ipv4",
+		"get",
+	}
+
+	handlerProcd := false
+	var render bytes.Buffer
+	handler := func(exe *interpose.Invocation) (bool, interpose.Message) {
+		handlerProcd = true
+
+		dir, file := path.Split(exe.Target)
+		if file != "esxcli" || (dir != "/bin/" && dir != "/usr/bin/") {
+			return false, nil
+		}
+
+		if len(exe.Args) != len(invocation) {
+			return false, nil
+		}
+
+		for i, arg := range invocation[1:] {
+			if exe.Args[i+1] != arg {
+				return false, nil
+			}
+		}
+
+		ipaddr := net.ParseIP(details.vmk.Spec.Ip.IpAddress)
+		ipmask := net.ParseIP(details.vmk.Spec.Ip.SubnetMask)
+		mask := net.IPv4Mask(ipmask[12], ipmask[13], ipmask[14], ipmask[15])
+
+		data := []esxcli{
+			{
+				Name:          details.vmk.Device,
+				DHCPAddress:   details.vmk.Spec.Ip.Dhcp,
+				DHCPDNS:       hs.Config.Network.DnsConfig.GetHostDnsConfig().Dhcp,
+				Gateway:       "",
+				IPv4Address:   details.vmk.Spec.Ip.IpAddress,
+				IPv4Broadcast: ipaddr.Mask(mask).String(),
+				IPv4Netmask:   ipmask.String(),
+			},
+		}
+
+		render = bytes.Buffer{}
+		err = tmpl.Execute(&render, data)
+		if err != nil {
+			assert.Nil(t, err, "expected template to process cleanly")
+			// we don't just panic/exit here because we've got a client part waiting for a response
+			return true, &interpose.Static{
+				ExitCode: 255,
+			}
+		}
+
+		static := &interpose.Static{
+			ExitCode: 0,
+		}
+		static.SetOutput(render.Bytes(), nil)
+
+		return true, static
+	}
+
+	// install an interpose handler
+	globalInterposeServer.handlers.RegisterHandler("test-handler", handler)
+
+	// TODO: install interpose in the container dynamically if it's not already at the target path
+	// TODO: make this a direct invocation of interpose to install itself, using the same path as the manifest driven one.
+
+	// will block in this call while handler gets invoked so we don't need to care about waitgroup
+	output, err = hs.sh.execAdv(ctx, invocation[0], invocation[1:], []string{"VCSIM_INTERPOSE_DEBUG_LOGS=true"}, nil)
 	assert.Nil(t, err, "expected to be able to execute commands in sim host")
-	assert.Equal(t, output, details.vmk.Spec.Ip.IpAddress, "expected IP address from command to match with spec")
+	assert.True(t, strings.Contains(output, details.vmk.Spec.Ip.IpAddress), "expected IP address from command to match with spec")
 
 	// confirm the handler fired and the execution reflected that
-
-	// get record of all interposed invocations from host
-
-	// confirm record contains interposed call
+	assert.True(t, handlerProcd, "expected handler to have been called and processed an invocaiton")
 
 	// TODO: check that we got the interpose messages we expected to for host bringup
 
