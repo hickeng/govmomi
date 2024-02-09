@@ -325,10 +325,11 @@ func createVolume(volumeName string, labels []string, files []tarEntry) (string,
 	return uid, err
 }
 
-var bridgeNames = []string{"docker0", "podman0"}
+var bridgeNames = []string{"docker0", "podman0", "eth0"}
 
 // getBridgeAddr retrieves the IP of the bridge NIC on the host. This can then be used to determine
 // an IP on the host that can route to the bridge to bind against for servers.
+// It tries "eth0" as a last resort
 func getBridgeAddr() (netip.Addr, error) {
 	var nif *net.Interface
 	var name string
@@ -659,8 +660,8 @@ func (c *container) stop(ctx *Context) error {
 	return err
 }
 
-// exec invokes the specified command, with executable being the first of the args, in the specified container
-// returns
+// exec invokes the specified command, with executable being the first of the args, in the specified container.
+// Returns
 //
 //	 string - combined stdout and stderr from command
 //	 err
