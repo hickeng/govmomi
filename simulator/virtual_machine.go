@@ -2265,6 +2265,27 @@ func (c *powerVMTask) Run(task *Task) (types.AnyType, types.BaseMethodFault) {
 			return nil, new(types.InvalidState)
 		}
 
+		// If no container backing is configured, check the ContainerImageRegistry.
+		// This allows tests to map VM config attributes (name, disk path) to OCI
+		// images without modifying the code under test. All ExtraConfig entries
+		// from the matched entry (including RUN.mountdmi, RUN.nestedContainers,
+		// etc.) are injected before the simVM is created.
+		if c.svm == nil {
+			if e := c.ctx.Map.ContainerImages.resolve(c.VirtualMachine); e.OCIImage != "" {
+				c.VirtualMachine.Config.ExtraConfig = append(
+					c.VirtualMachine.Config.ExtraConfig,
+					&types.OptionValue{Key: ContainerBackingOptionKey, Value: e.OCIImage},
+				)
+				for k, v := range e.ExtraConfig {
+					c.VirtualMachine.Config.ExtraConfig = append(
+						c.VirtualMachine.Config.ExtraConfig,
+						&types.OptionValue{Key: k, Value: v},
+					)
+				}
+				c.svm = createSimulationVM(c.VirtualMachine)
+			}
+		}
+
 		err := c.svm.start(c.ctx)
 		if err != nil {
 			return nil, &types.MissingPowerOnConfiguration{
