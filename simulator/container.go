@@ -220,9 +220,18 @@ func createVolume(volumeName string, labels []string, files []tarEntry) (uid str
 		cmd := exec.Command("docker", run...)
 		out, err := cmd.Output()
 		if err != nil {
-			return "", commandError("volume create", cmd.Args, err)
+			// Podman (unlike Docker) rejects volume create when the volume already
+			// exists; Docker is idempotent here.  Named volumes can be implicitly
+			// created by "docker create -v name:/path" before we reach this explicit
+			// create, so treat "already exists" as success and continue to populate.
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || !strings.Contains(string(exitErr.Stderr), "already exists") {
+				return "", commandError("volume create", cmd.Args, err)
+			}
+			uid = name // volume already exists; provided name is the uid
+		} else {
+			uid = strings.TrimSpace(string(out))
 		}
-		uid = strings.TrimSpace(string(out))
 
 		if name == "" {
 			name = uid
@@ -450,10 +459,22 @@ func create(ctx *Context, name string, id string, networks []string, volumes []s
 
 	// this combines all the run options into a single string that's passed to /bin/bash -c as the single argument to force bash parsing.
 	// TODO: make this configurable behaviour so users also have the option of not escaping everything for bash
-	cmd := exec.Command(shell, "-c", strings.Join(run, " "))
+	createArgs := strings.Join(run, " ")
+	cmd := exec.Command(shell, "-c", createArgs)
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, commandError("container create", cmd.Args, err)
+		// When the container name is already in use (e.g. from a previous test run
+		// that was killed before cleanup), force-remove it by name and retry once.
+		if eErr, ok := err.(*exec.ExitError); ok && strings.Contains(string(eErr.Stderr), "already in use") {
+			log.Printf("container create: name %q already in use, removing stale container and retrying", c.name)
+			rmCmd := exec.Command("docker", "rm", "-f", c.name)
+			_ = rmCmd.Run()
+			cmd = exec.Command(shell, "-c", createArgs)
+			out, err = cmd.Output()
+		}
+		if err != nil {
+			return nil, commandError("container create", cmd.Args, err)
+		}
 	}
 
 	c.id = strings.TrimSpace(string(out))
