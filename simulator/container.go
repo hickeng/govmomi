@@ -29,6 +29,28 @@ var (
 	eventWatch eventWatcher
 )
 
+// shellQuote wraps s in POSIX single quotes, escaping any embedded single
+// quotes with the '\'' sequence.  Use this before appending container image
+// names or command args to the bash -c string in create().
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// filterSeccompUnconfined removes the "--security-opt seccomp=unconfined" pair
+// from run (in-place, preserving order).  Used when a custom seccomp profile
+// replaces the unconfined setting added by nestedContainers mode.
+func filterSeccompUnconfined(run []string) []string {
+	out := run[:0]
+	for i := 0; i < len(run); i++ {
+		if run[i] == "--security-opt" && i+1 < len(run) && run[i+1] == "seccomp=unconfined" {
+			i++ // skip both tokens
+			continue
+		}
+		out = append(out, run[i])
+	}
+	return out
+}
+
 const (
 	deleteWithContainer = "lifecycle=container"
 	createdByVcsim      = "createdBy=vcsim"
@@ -369,6 +391,7 @@ func createBridge(bridgeName string, labels ...string) (string, error) {
 	return id, nil
 }
 
+
 // create
 //   - name - pretty name, eg. vm name
 //   - id - uuid or similar - this is merged into container name rather than dictating containerID
@@ -378,7 +401,17 @@ func createBridge(bridgeName string, labels ...string) (string, error) {
 //   - nestedContainers - if true, adds flags required for running containers inside the container (e.g., Kubernetes)
 //   - optsAndImage - pass-though options and must include at least the container image to use, including tag if necessary
 //   - args - the command+args to pass to the container
-func create(ctx *Context, name string, id string, networks []string, volumes []string, ports []string, env []string, nestedContainers bool, image string, args []string) (*container, error) {
+// create allocates a container for the simulated VM.
+//
+// quoteImageAndArgs controls shell quoting of image and args before they are
+// joined into the bash -c command string:
+//   - true  → JSON-array format: image is a bare name, args are separate tokens
+//     that may contain shell metacharacters (&&, ;, spaces) — each is wrapped
+//     in POSIX single quotes so bash does not re-interpret them.
+//   - false → legacy string format: the image field holds the entire raw
+//     docker-run flag string (e.g. "-v '/path' nginx"), which must be passed
+//     verbatim to bash for word-splitting to work correctly.
+func create(ctx *Context, name string, id string, networks []string, volumes []string, ports []string, env []string, nestedContainers bool, seccompProfile string, image string, args []string, quoteImageAndArgs bool) (*container, error) {
 	if len(image) == 0 {
 		return nil, errors.New("cannot create container backing without an image")
 	}
@@ -388,9 +421,12 @@ func create(ctx *Context, name string, id string, networks []string, volumes []s
 	c.changes = make(chan struct{})
 
 	for i := range volumes {
-		// we'll pre-create anonymous volumes, simply for labelling consistency
+		// Pre-create named Docker volumes for labelling consistency.
+		// Skip bind mounts (host paths starting with "/") — those already exist.
 		volName := strings.Split(volumes[i], ":")
-		createVolume(volName[0], []string{deleteWithContainer, "container=" + c.name}, nil)
+		if !strings.HasPrefix(volName[0], "/") {
+			createVolume(volName[0], []string{deleteWithContainer, "container=" + c.name}, nil)
+		}
 	}
 
 	// assemble env
@@ -444,18 +480,42 @@ func create(ctx *Context, name string, id string, networks []string, volumes []s
 			"--volume", "/lib/modules:/lib/modules:ro",
 			"--device", "/dev/fuse",
 		)
+
 	} else {
 		// Standard mode: use host cgroup namespace for access to all controllers
 		// --cgroupns=host: gives access to all cgroup controllers (cpuset, etc.)
 		run = append(run, "--cgroupns=host")
 	}
 
+	if seccompProfile != "" {
+		// RUN.vmci=true generates a per-VM seccomp filter with
+		// defaultAction=SCMP_ACT_ALLOW plus AF_VSOCK intercept rules.
+		// Remove any "--security-opt seccomp=unconfined" that nestedContainers mode
+		// already added — two seccomp options confuse podman/runc.
+		run = filterSeccompUnconfined(run)
+		run = append(run, "--security-opt", "seccomp="+seccompProfile)
+	}
+
 	run = append(run, dockerNet...)
 	run = append(run, dockerVol...)
 	run = append(run, dockerPort...)
 	run = append(run, dockerEnv...)
-	run = append(run, image)
-	run = append(run, args...)
+	if quoteImageAndArgs {
+		// JSON-array format: image is a plain name and args are separate tokens.
+		// Apply POSIX single-quote escaping so the host bash shell does not
+		// interpret metacharacters (&&, ;, $, etc.) that appear in container
+		// entrypoints or sh -c scripts.
+		run = append(run, shellQuote(image))
+		for _, arg := range args {
+			run = append(run, shellQuote(arg))
+		}
+	} else {
+		// Legacy string format: image holds the entire raw docker-run argument
+		// string (e.g. "-v '/path:/dst:ro' nginx"), passed verbatim so bash
+		// performs word-splitting and tilde/glob expansion as the caller intended.
+		run = append(run, image)
+		run = append(run, args...)
+	}
 
 	// this combines all the run options into a single string that's passed to /bin/bash -c as the single argument to force bash parsing.
 	// TODO: make this configurable behaviour so users also have the option of not escaping everything for bash

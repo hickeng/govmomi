@@ -29,6 +29,10 @@
 //     --volume /var, --volume /lib/modules:/lib/modules:ro, --device /dev/fuse.
 //     Reference: https://github.com/kubernetes-sigs/kind/blob/main/pkg/cluster/internal/providers/docker/provision.go
 //
+//   - RUN.vmci: Boolean. Activate the full VMCI/vsock simulation layer:
+//     Component A (GuestRPC unix socket server) + Component B (seccomp AF_VSOCK
+//     interception).  Requires Linux 5.9+ and runc/podman with listenerPath support.
+//
 //   - RUN.port.<containerPort>: Map container port to host port.
 //     Example: RUN.port.80 = "8080" maps container port 80 to host port 8080.
 //
@@ -36,7 +40,9 @@
 //     Example: RUN.env.DEBUG = "true" sets DEBUG=true in the container.
 //
 //   - guestinfo.*: Passed as VMX_GUESTINFO_* environment variables.
-//     Used by cloud-init VMware datasource with EnvVar transport.
+//     The VMX_GUESTINFO=true sentinel (EnvVar transport) is set only when
+//     RUN.vmci is not enabled; with RUN.vmci=true the container uses the
+//     GuestRPC/vsock path instead (higher fidelity).
 //
 // # Example: Basic Container
 //
@@ -96,8 +102,10 @@ var (
 )
 
 type simVM struct {
-	vm *VirtualMachine
-	c  *container
+	vm       *VirtualMachine
+	c        *container
+	guestRPC *GuestRPCServer // non-nil when RUN.vmci=true; per-VM unix socket RPCI server
+	vsockVI  *vsockIntercept // non-nil when RUN.vmci=true; seccomp AF_VSOCK interceptor
 }
 
 // createSimulationVM inspects the provided VirtualMachine and creates a simVM binding for it if
@@ -313,16 +321,25 @@ func (svm *simVM) start(ctx *Context) error {
 	var env []string
 	var ports []string
 	var networks []string
+	var extraVolumes []string
 	mountDMI := true
 	nestedContainers := false
 
+	// jsonArgs is true when ContainerBackingOptionKey value was a valid JSON
+	// array (structured format: ["image","arg1","arg2"]).  It is false for the
+	// legacy raw-string format ("-v '/path' image").  create() uses this flag
+	// to decide whether to POSIX-quote image and args before passing them to
+	// the host bash shell, preventing metacharacters (&&, ;) in sh -c scripts
+	// from being interpreted by the host rather than the container shell.
+	jsonArgs := false
 	for _, opt := range svm.vm.Config.ExtraConfig {
 		val := opt.GetOptionValue()
 		if val.Key == ContainerBackingOptionKey {
 			run := val.Value.(string)
-			err := json.Unmarshal([]byte(run), &args)
-			if err != nil {
+			if err := json.Unmarshal([]byte(run), &args); err != nil {
 				args = []string{run}
+			} else {
+				jsonArgs = true
 			}
 
 			continue
@@ -369,6 +386,19 @@ func (svm *simVM) start(ctx *Context) error {
 			continue
 		}
 
+		if strings.HasPrefix(val.Key, "RUN.volume.") {
+			// RUN.volume.<label> adds an extra bind mount or named volume.
+			// Value format: "host_path:container_path[:options]" — the same
+			// format accepted by docker/podman -v.  Use this to inject
+			// test-specific files (scripts, configs) into the container without
+			// modifying the container image or container.go.
+			if v := strings.TrimSpace(val.Value.(string)); v != "" {
+				extraVolumes = append(extraVolumes, v)
+			}
+
+			continue
+		}
+
 		if strings.HasPrefix(val.Key, "RUN.env.") {
 			sKey := strings.Split(val.Key, ".")
 			envKey := sKey[len(sKey)-1]
@@ -388,18 +418,54 @@ func (svm *simVM) start(ctx *Context) error {
 		return nil
 	}
 
-	if len(env) != 0 {
-		// Configure env as the data access method for cloud-init-vmware-guestinfo
+	if len(env) != 0 && !vmciEnabled(svm.vm.Config.ExtraConfig) {
+		// VMX_GUESTINFO=true tells cloud-init-vmware-guestinfo to use the env-var
+		// transport (lower fidelity).  Suppress it when RUN.vmci=true because the
+		// container can reach guestinfo via the GuestRPC/vsock path instead.
 		env = append(env, "VMX_GUESTINFO=true")
+	}
+
+	// VMCI simulation: start the per-VM GuestRPC server before creating the container
+	// so the socket exists when the container process first connects to it.
+	// Activated by RUN.vmci=true.
+	// Component A: GuestRPC server over unix socket (no kernel requirements).
+	// Component B: seccomp AF_VSOCK interception via listenerPath (kernel ≥5.9, runc ≥1.0).
+	// serve() loops on Accept() so both the initial container start and each
+	// subsequent podman exec get their own seccompFd event-loop goroutine.
+	seccompProfile := ""
+	if vmciEnabled(svm.vm.Config.ExtraConfig) {
+		socketPath := GuestRPCSocketPath(svm.vm.uid.String())
+		srv := newGuestRPCServer(svm.vm, socketPath)
+		if err := srv.Start(ctx); err != nil {
+			return fmt.Errorf("guestrpc server: %w", err)
+		}
+		svm.guestRPC = srv
+
+		// Advertise the socket path inside the container and mount it.
+		extraVolumes = append(extraVolumes, guestRPCVolumeMount(socketPath))
+		env = append(env, "VMX_RPC_SOCK="+GuestRPCSocketName)
+	}
+
+	// Component B: write the seccomp filter JSON before docker create so the
+	// --security-opt seccomp=<path> flag is available.  The listener socket is
+	// bound just before docker start (Phase 2, below) so crun can connect the
+	// moment the container process starts — no race with goroutine scheduling.
+	//
+	// When nestedContainers=true, create() strips the "--security-opt
+	// seccomp=unconfined" flag and appends the VMCI profile instead, preserving
+	// --cgroupns=private and --privileged.
+	if svm.guestRPC != nil {
+		seccompProfile = vsockWriteFilterFile(svm.vm.uid.String())
 	}
 
 	volumes := []string{}
 	if mountDMI {
 		volumes = append(volumes, constructVolumeName(svm.vm.Name, svm.vm.uid.String(), "dmi")+":/sys/class/dmi/id")
 	}
+	volumes = append(volumes, extraVolumes...)
 
 	var err error
-	svm.c, err = create(ctx, svm.vm.Name, svm.vm.uid.String(), networks, volumes, ports, env, nestedContainers, args[0], args[1:])
+	svm.c, err = create(ctx, svm.vm.Name, svm.vm.uid.String(), networks, volumes, ports, env, nestedContainers, seccompProfile, args[0], args[1:], jsonArgs)
 	if err != nil {
 		return err
 	}
@@ -412,6 +478,14 @@ func (svm *simVM) start(ctx *Context) error {
 		if err != nil {
 			return err
 		}
+	}
+
+	// Phase 2: bind the listenerPath socket synchronously before docker start.
+	// The socket is in the kernel's listen state before this returns, so crun
+	// can connect the moment the container process starts — no scheduler race.
+	// Stored in svm.vsockVI so Stop() is called on VM power-off/destroy.
+	if seccompProfile != "" {
+		svm.vsockVI = newVsockInterceptAndStart(svm.vm.uid.String(), GuestRPCSocketPath(svm.vm.uid.String()), seccompProfile)
 	}
 
 	err = svm.c.start(ctx)
@@ -487,8 +561,14 @@ func (svm *simVM) stop(ctx *Context) error {
 	err := svm.c.stop(ctx)
 	if err != nil {
 		log.Printf("%s %s: %s", svm.vm.Name, "stop", err)
-
 		return err
+	}
+
+	if svm.vsockVI != nil {
+		svm.vsockVI.Stop()
+	}
+	if svm.guestRPC != nil {
+		svm.guestRPC.Stop()
 	}
 
 	ctx.Update(svm.vm, toolsNotRunning)
@@ -538,10 +618,31 @@ func (svm *simVM) remove(ctx *Context) error {
 		return nil
 	}
 
+	// Stop the container BEFORE stopping the vsock intercept.
+	//
+	// vsockIntercept.Stop() blocks on wg.Wait() until all event-loop goroutines
+	// exit.  Those goroutines are blocked in SECCOMP_IOCTL_NOTIF_RECV, which
+	// only unblocks when the supervised container process exits.  Stopping the
+	// container first ensures supervised processes exit before we call Stop().
+	//
+	// container.stop() runs "docker stop" (pure shell, no registry lock), so it
+	// is safe to call here even when Model.Remove() holds the registry's m lock.
+	if svm.vsockVI != nil {
+		if err := svm.c.stop(ctx); err != nil {
+			log.Printf("%s remove: pre-vsock stop: %v", svm.vm.Name, err)
+		}
+	}
+
+	if svm.vsockVI != nil {
+		svm.vsockVI.Stop()
+	}
+	if svm.guestRPC != nil {
+		svm.guestRPC.Stop()
+	}
+
 	err := svm.c.remove(ctx)
 	if err != nil {
 		log.Printf("%s %s: %s", svm.vm.Name, "remove", err)
-
 		return err
 	}
 
