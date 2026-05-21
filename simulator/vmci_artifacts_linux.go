@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 )
 
@@ -22,69 +23,96 @@ var (
 	vmciArtifactsErr          error
 )
 
-// buildVmciArtifacts builds the Go binaries needed for VMCI simulation once per
-// process and returns the paths to:
-//   - guestBinPath:    vmci-guest  (test agent binary; injected at /vmci-guest)
-//   - toolboxBinPath:  toolbox     (govmomi/toolbox binary; injected as /usr/bin/vmware-rpctool)
+// artifactsBinDir returns the stable host directory used to cache vmci
+// simulation binaries across test invocations.
 //
-// The function is idempotent and thread-safe.  It is called automatically
-// inside simVM.start() when RUN.vmci=true — callers do not need to build or
-// inject either binary explicitly.
+// The directory is simulator/bin/ relative to this source file so that the
+// binaries persist between "go test" runs.  When a binary already exists it is
+// re-used without invoking "go build", benefiting from Go's incremental build:
+// repeated test runs pay the compilation cost only on the first invocation (or
+// after sources change and the caller deletes the stale binary).
 //
-// Both builds require only the Go toolchain.
+// To force a rebuild, delete the cache directory:
+//
+//	rm -rf <govmomi>/simulator/bin/
+//
+// Falls back to os.MkdirTemp when the source path is unavailable (e.g. binaries
+// built with -trimpath or deployed outside the source tree).
+func artifactsBinDir() (string, error) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		return os.MkdirTemp("", "vcsim-vmci-artifacts-*")
+	}
+	dir := filepath.Join(filepath.Dir(thisFile), "bin")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("vmci-artifacts: mkdir %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
+// buildVmciArtifacts returns the paths to the VMCI simulation binaries,
+// building them only if they are not already present in the cache directory:
+//   - guestBinPath:   vmci-guest  (test agent; injected at /vmci-guest)
+//   - toolboxBinPath: toolbox     (govmomi/toolbox; injected as /usr/bin/vmware-rpctool)
+//
+// The function is idempotent and thread-safe (sync.Once per process).  It is
+// called automatically inside simVM.start() when RUN.vmci=true.
 func buildVmciArtifacts() (guestBinPath, toolboxBinPath string, err error) {
 	vmciArtifactsOnce.Do(func() {
-		dir, mkErr := os.MkdirTemp("", "vcsim-vmci-artifacts-*")
+		dir, mkErr := artifactsBinDir()
 		if mkErr != nil {
 			vmciArtifactsErr = mkErr
 			return
 		}
 
-		// Build the vmci-guest static binary.  Injected at /vmci-guest for
-		// govmomi test subcommands (grpc-set, grpc-get, bidi, …).
+		// vmci-guest: test agent binary injected at /vmci-guest.
+		// Build failure is fatal — the test agent is always required.
 		guestBin := filepath.Join(dir, "vmci-guest")
-		goBuild := exec.Command(
-			"go", "build",
-			"-o", guestBin,
-			"github.com/vmware/govmomi/simulator/testdata/vmci-guest",
-		)
-		goBuild.Env = append(os.Environ(),
-			"CGO_ENABLED=0",
-			"GOOS=linux",
-			"GOARCH=amd64",
-		)
-		if out, buildErr := goBuild.CombinedOutput(); buildErr != nil {
-			vmciArtifactsErr = fmt.Errorf("vmci-guest build: %w\n%s", buildErr, out)
-			return
+		if _, statErr := os.Stat(guestBin); os.IsNotExist(statErr) {
+			goBuild := exec.Command(
+				"go", "build",
+				"-o", guestBin,
+				"github.com/vmware/govmomi/simulator/testdata/vmci-guest",
+			)
+			goBuild.Env = append(os.Environ(),
+				"CGO_ENABLED=0",
+				"GOOS=linux",
+				"GOARCH=amd64",
+			)
+			if out, buildErr := goBuild.CombinedOutput(); buildErr != nil {
+				vmciArtifactsErr = fmt.Errorf("vmci-guest build: %w\n%s", buildErr, out)
+				return
+			}
+			log.Printf("vmci-artifacts: built vmci-guest at %s", guestBin)
+		} else {
+			log.Printf("vmci-artifacts: vmci-guest cached at %s", guestBin)
 		}
 		vmciArtifactsGuestPath = guestBin
-		log.Printf("vmci-artifacts: built vmci-guest at %s", guestBin)
 
-		// Build the govmomi/toolbox binary.  Injected at /usr/bin/vmware-rpctool
-		// so cloud-init and other guests can write/read guestinfo via AF_VSOCK +
-		// DataMap framing without touching the VMware x86 backdoor instruction.
+		// toolbox: govmomi/toolbox binary injected at /usr/bin/vmware-rpctool.
+		// Build failure is non-fatal — auto-injection is skipped but tests may
+		// still inject the binary explicitly via RUN.volume.
 		toolboxBin := filepath.Join(dir, "toolbox")
-		toolboxBuild := exec.Command(
-			"go", "build",
-			"-o", toolboxBin,
-			"github.com/vmware/govmomi/toolbox/toolbox",
-		)
-		toolboxBuild.Env = append(os.Environ(),
-			"CGO_ENABLED=0",
-			"GOOS=linux",
-			"GOARCH=amd64",
-		)
-		if out, buildErr := toolboxBuild.CombinedOutput(); buildErr != nil {
-			// Non-fatal: toolbox failure only skips the /usr/bin/vmware-rpctool
-			// auto-injection.  Tests can still inject the binary explicitly via
-			// RUN.volume.  vmci-guest (the test agent) is always required; its
-			// build failure is fatal (sets vmciArtifactsErr) and prevents any
-			// injection.
-			log.Printf("vmci-artifacts: toolbox build failed (%v); vmware-rpctool auto-injection skipped\n%s", buildErr, out)
-		} else {
-			vmciArtifactsToolboxPath = toolboxBin
+		if _, statErr := os.Stat(toolboxBin); os.IsNotExist(statErr) {
+			toolboxBuild := exec.Command(
+				"go", "build",
+				"-o", toolboxBin,
+				"github.com/vmware/govmomi/toolbox/toolbox",
+			)
+			toolboxBuild.Env = append(os.Environ(),
+				"CGO_ENABLED=0",
+				"GOOS=linux",
+				"GOARCH=amd64",
+			)
+			if out, buildErr := toolboxBuild.CombinedOutput(); buildErr != nil {
+				log.Printf("vmci-artifacts: toolbox build failed (%v); vmware-rpctool auto-injection skipped\n%s", buildErr, out)
+				return
+			}
 			log.Printf("vmci-artifacts: built toolbox at %s", toolboxBin)
+		} else {
+			log.Printf("vmci-artifacts: toolbox cached at %s", toolboxBin)
 		}
+		vmciArtifactsToolboxPath = toolboxBin
 	})
 	return vmciArtifactsGuestPath, vmciArtifactsToolboxPath, vmciArtifactsErr
 }
