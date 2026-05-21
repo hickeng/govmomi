@@ -40,9 +40,12 @@
 //     Example: RUN.env.DEBUG = "true" sets DEBUG=true in the container.
 //
 //   - guestinfo.*: Passed as VMX_GUESTINFO_* environment variables.
-//     The VMX_GUESTINFO=true sentinel (EnvVar transport) is set only when
-//     RUN.vmci is not enabled; with RUN.vmci=true the container uses the
-//     GuestRPC/vsock path instead (higher fidelity).
+//     VMX_GUESTINFO=true is always set so cloud-init can use the env-var
+//     transport (DataSourceVMwareGuestInfo) as a reliable fallback when the
+//     Python vmtools library inside the container cannot reach the backdoor.
+//     With RUN.vmci=true, in-container write operations (e.g. bootstrapper
+//     writing guestinfo.supervisor.enable.status) still go through GuestRPC
+//     via the vmci-guest binary injected at /usr/bin/vmware-rpctool.
 //
 // # Example: Basic Container
 //
@@ -418,10 +421,19 @@ func (svm *simVM) start(ctx *Context) error {
 		return nil
 	}
 
-	if len(env) != 0 && !vmciEnabled(svm.vm.Config.ExtraConfig) {
-		// VMX_GUESTINFO=true tells cloud-init-vmware-guestinfo to use the env-var
-		// transport (lower fidelity).  Suppress it when RUN.vmci=true because the
-		// container can reach guestinfo via the GuestRPC/vsock path instead.
+	if len(env) != 0 {
+		// VMX_GUESTINFO=true tells cloud-init-vmware-guestinfo to use the
+		// env-var transport (DataSourceVMwareGuestInfo).
+		//
+		// We set this even when RUN.vmci=true because cloud-init's primary
+		// DataSourceVMware (using Python vmtools library) can fail in containers
+		// where the Python library triggers ioctls that our shim doesn't
+		// emulate.  cloud-init falls back to DataSourceVMwareGuestInfo, which
+		// reads the VMX_GUESTINFO_* env vars set below — reliable and fast.
+		//
+		// In-container WRITE operations (e.g. bootstrapper writing
+		// guestinfo.supervisor.enable.status) still use GuestRPC via the
+		// vmci-guest binary injected at /usr/bin/vmware-rpctool.
 		env = append(env, "VMX_GUESTINFO=true")
 	}
 
@@ -444,6 +456,49 @@ func (svm *simVM) start(ctx *Context) error {
 		// Advertise the socket path inside the container and mount it.
 		extraVolumes = append(extraVolumes, guestRPCVolumeMount(socketPath))
 		env = append(env, "VMX_RPC_SOCK="+GuestRPCSocketName)
+
+		// Auto-inject the LD_PRELOAD backdoor shim unless the caller already
+		// set LD_PRELOAD explicitly (via RUN.env.LD_PRELOAD in ExtraConfig).
+		//
+		// Two artefacts are mounted into the container:
+		//   1. /vmci-backdoor-shim.so  — the LD_PRELOAD target; overrides
+		//      VMware backdoor and VMCISock functions so vmtoolsd does not
+		//      execute the x86 IN instruction (SIGILL in containers).
+		//   2. /etc/systemd/system.conf.d/vmci-shim.conf — systemd Manager
+		//      drop-in that sets DefaultEnvironment=LD_PRELOAD=…; required
+		//      because systemd does NOT forward PID1's environment to the
+		//      services it spawns (vmtoolsd, cloud-init, bootstrapper).
+		//      Docker/Podman create the parent directory if absent, so this
+		//      mount is safe in both systemd and non-systemd containers.
+		shimSo, shimConf, guestBin, shimBuildErr := buildVmciShim()
+		if shimBuildErr != nil {
+			log.Printf("%s: vmci shim build failed (%v); vmtoolsd/vmware-rpctool will not work", svm.vm.Name, shimBuildErr)
+		} else {
+			// Inject the vmci-guest static binary at two paths:
+			//   /vmci-guest              — test subcommands (grpc-set, grpc-get, …)
+			//   /usr/bin/vmware-rpctool  — overrides the system vmware-rpctool;
+			//     cloud-init calls this to read guestinfo.metadata/userdata.
+			//     The system binary is often statically linked so LD_PRELOAD never
+			//     applies; our binary talks to the GuestRPC unix socket directly.
+			extraVolumes = append(extraVolumes,
+				guestBin+":/vmci-guest:ro",
+				guestBin+":/usr/bin/vmware-rpctool:ro",
+				shimConf+":/etc/systemd/system.conf.d/vmci-shim.conf:ro",
+			)
+			// LD_PRELOAD for dynamically-linked binaries (vmtoolsd, etc.).
+			// Skip injection if the caller already set LD_PRELOAD explicitly.
+			alreadyHasLDPreload := false
+			for _, e := range env {
+				if strings.HasPrefix(e, "LD_PRELOAD=") {
+					alreadyHasLDPreload = true
+					break
+				}
+			}
+			if !alreadyHasLDPreload && shimSo != "" {
+				extraVolumes = append(extraVolumes, shimSo+":/vmci-backdoor-shim.so:ro")
+				env = append(env, "LD_PRELOAD=/vmci-backdoor-shim.so")
+			}
+		}
 	}
 
 	// Component B: write the seccomp filter JSON before docker create so the

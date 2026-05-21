@@ -7,6 +7,7 @@
 package simulator
 
 import (
+	"bufio"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -92,6 +95,20 @@ func vsockWriteFilterFile(vmUID string) string {
 					// arg[0] == AF_VSOCK (40)
 					{Index: 0, Value: 40, Op: "SCMP_CMP_EQ"},
 				},
+			},
+			{
+				Names:  []string{"bind"},
+				Action: "SCMP_ACT_NOTIFY",
+				// No arg filter: intercept all bind() calls.
+				// handleBind checks whether the FD is a tracked vsock socket;
+				// non-vsock FDs receive SECCOMP_USER_NOTIF_FLAG_CONTINUE so the
+				// kernel executes them normally.
+				//
+				// This is required because SocketConnectVmciInternal (simpleSocket.c)
+				// calls bind(fd, AF_VSOCK_sockaddr) with a privileged source port
+				// before calling connect().  The injected unix socket FD would get
+				// EINVAL from the kernel for an AF_VSOCK sockaddr, causing vsock
+				// channel startup to abort before connect() is ever called.
 			},
 			{
 				Names:  []string{"connect"},
@@ -519,11 +536,11 @@ func (vi *vsockIntercept) eventLoop(seccompFd int) error {
 			log.Printf("vsockIntercept %s: RECV socket(AF_VSOCK) #%d pid=%d args=%v",
 				vi.vmUID, count, notif.PID, notif.Data.Args[:3])
 			go vi.handleSocket(seccompFd, &notif)
+		case int32(syscall.SYS_BIND):
+			go vi.handleBind(seccompFd, &notif)
 		case int32(syscall.SYS_CONNECT):
-			if count <= 3 || count%500 == 0 {
-				log.Printf("vsockIntercept %s: RECV connect #%d pid=%d fd=%d (filter active)",
-					vi.vmUID, count, notif.PID, notif.Data.Args[0])
-			}
+			log.Printf("vsockIntercept %s: RECV connect #%d pid=%d fd=%d",
+				vi.vmUID, count, notif.PID, notif.Data.Args[0])
 			go vi.handleConnect(seccompFd, &notif)
 		default:
 			log.Printf("vsockIntercept %s: RECV unknown nr=%d #%d pid=%d",
@@ -566,16 +583,53 @@ func (vi *vsockIntercept) handleSocket(seccompFd int, notif *seccompNotif) {
 		return
 	}
 
-	// Record the (PID, allocatedFD) → hostFd mapping.
+	// Record the (TGID, allocatedFD) → hostFd mapping.
+	// Use TGID (thread group ID = process PID) not TID: socket() and connect()
+	// may be called by different threads in the same process; all threads share
+	// the FD table so TGID+FD uniquely identifies the socket.
+	tgid := tidToTGID(notif.PID)
 	vi.mu.Lock()
-	vi.tracked[pidFDKey{pid: notif.PID, fd: uint64(allocatedFD)}] = hostFd
+	vi.tracked[pidFDKey{pid: tgid, fd: uint64(allocatedFD)}] = hostFd
 	vi.mu.Unlock()
 
-	log.Printf("vsockIntercept %s: socket(AF_VSOCK) pid=%d → allocatedFD=%d (hostFd=%d)",
-		vi.vmUID, notif.PID, allocatedFD, hostFd)
+	log.Printf("vsockIntercept %s: socket(AF_VSOCK) tid=%d tgid=%d → allocatedFD=%d (hostFd=%d)",
+		vi.vmUID, notif.PID, tgid, allocatedFD, hostFd)
 
 	// Return the allocated FD number as the result of socket().
 	vi.respond(seccompFd, notif.ID, int64(allocatedFD), 0, 0)
+}
+
+// handleBind intercepts bind() calls.
+//
+// vmtoolsd's SocketConnectVmciInternal (simpleSocket.c) calls:
+//
+//	bind(fd, &localAddr, sizeof localAddr)
+//
+// where localAddr is a struct sockaddr_vm with a privileged source port.
+// The fd is our injected unix socketpair FD.  The kernel rejects an
+// AF_VSOCK sockaddr on a unix socket (EINVAL), which causes vsock channel
+// startup to abort before connect() is ever called.
+//
+// For tracked vsock FDs we return 0 (success) without kernel execution.
+// All other bind() calls (TCP, plain unix, etc.) are passed to the kernel
+// unchanged via FLAG_CONTINUE.
+func (vi *vsockIntercept) handleBind(seccompFd int, notif *seccompNotif) {
+	fd := notif.Data.Args[0]
+	tgid := tidToTGID(notif.PID)
+
+	vi.mu.Lock()
+	_, ok := vi.tracked[pidFDKey{pid: tgid, fd: fd}]
+	vi.mu.Unlock()
+
+	if !ok {
+		// Not a vsock FD we manage; let the kernel handle it normally.
+		vi.respond(seccompFd, notif.ID, 0, 0, seccompUserNotifFlagContinue)
+		return
+	}
+
+	log.Printf("vsockIntercept %s: bind fd=%d tgid=%d (tracked vsock socket) → returning success",
+		vi.vmUID, fd, tgid)
+	vi.respond(seccompFd, notif.ID, 0, 0, 0)
 }
 
 // handleConnect intercepts connect() calls.
@@ -587,8 +641,11 @@ func (vi *vsockIntercept) handleSocket(seccompFd int, notif *seccompNotif) {
 func (vi *vsockIntercept) handleConnect(seccompFd int, notif *seccompNotif) {
 	fd := notif.Data.Args[0]
 
+	// Use TGID to match the key written by handleSocket (same thread-group shares FDs).
+	tgid := tidToTGID(notif.PID)
+
 	vi.mu.Lock()
-	hostFd, ok := vi.tracked[pidFDKey{pid: notif.PID, fd: fd}]
+	hostFd, ok := vi.tracked[pidFDKey{pid: tgid, fd: fd}]
 	vi.mu.Unlock()
 
 	if !ok {
@@ -596,6 +653,8 @@ func (vi *vsockIntercept) handleConnect(seccompFd int, notif *seccompNotif) {
 		vi.respond(seccompFd, notif.ID, 0, 0, seccompUserNotifFlagContinue)
 		return
 	}
+	log.Printf("vsockIntercept %s: connect tracked fd=%d tid=%d tgid=%d → hostFd=%d",
+		vi.vmUID, fd, notif.PID, tgid, hostFd)
 
 	// Read sockaddr_vm from the container process to extract CID and port.
 	cid, port := vi.readSockaddrVM(notif.PID, notif.Data.Args[1], notif.Data.Args[2])
@@ -674,6 +733,34 @@ func (vi *vsockIntercept) bridgeToGuestRPC(hostFd int) {
 		}
 	}()
 	wg.Wait()
+}
+
+// tidToTGID returns the Thread Group ID (TGID = "process PID") for the given
+// thread ID by reading /proc/<tid>/status.  In seccomp notifications, notif.PID
+// is the TID of the calling thread, not the TGID.  For multi-threaded processes,
+// a socket created by thread A (TID=X) may have connect() called by thread B
+// (TID=Y); both share the same FD table.  Using TGID as the key ensures we
+// find the tracked entry regardless of which thread calls the syscall.
+//
+// Falls back to tid on any error (single-threaded process case).
+func tidToTGID(tid uint32) uint32 {
+	f, err := os.Open(fmt.Sprintf("/proc/%d/status", tid))
+	if err != nil {
+		return tid
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "Tgid:") {
+			tgid, err := strconv.ParseUint(strings.TrimSpace(line[5:]), 10, 32)
+			if err == nil {
+				return uint32(tgid)
+			}
+		}
+	}
+	return tid
 }
 
 // readSockaddrVM reads a sockaddr_vm from the container process's address space

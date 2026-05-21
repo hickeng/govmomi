@@ -25,6 +25,13 @@
 //	    Connect via AF_VSOCK to port 976, set KEY=VALUE, then get KEY and verify
 //	    the round-trip.  Exits 0 on success.  Replaces vsock-test-intercept.
 //
+//	rpc-cmd COMMAND
+//	    Send COMMAND (a single string, e.g. "info-get guestinfo.KEY") to the
+//	    GuestRPC server via AF_VSOCK port 976.  On success prints the bare value
+//	    (without the "1 " prefix) to stdout and exits 0; exits 1 on failure.
+//	    Also invoked implicitly when the binary is named "vmware-rpctool" so
+//	    it can act as a drop-in replacement for the system vmware-rpctool.
+//
 //	bidi PORT WANT_FROM_HOST SEND_TO_HOST
 //	    Connect via AF_VSOCK to PORT.  Read a newline-terminated message from
 //	    the host and verify it equals WANT_FROM_HOST.  Send SEND_TO_HOST
@@ -44,6 +51,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -218,6 +226,42 @@ func cmdGRPCGet(key string) error {
 	return nil
 }
 
+// cmdRPCCmd sends a raw GuestRPC command string and prints the raw server
+// response, matching the real vmware-rpctool wire contract:
+//
+//	Exit 0 + print "1 VALUE"          when the server responds "1 VALUE" (found)
+//	Exit 0 + print "0 No value found" when the server responds "0 ..." (missing key)
+//	Exit 1 (no output)                on channel failure (connect error, I/O error)
+//
+// This exit-code semantics is CRITICAL for cloud-init's DataSourceVMware:
+//   - Exit 0 → VMware environment detected (datasource selects DataSourceVMware)
+//   - Exit 1 → channel failure → datasource falls back to None
+//
+// The real vmware-rpctool binary prints the raw "1 …" / "0 …" response and
+// exits 0 for any successful channel round-trip (including "key not found").
+// cloud-init parses the "1 " prefix itself to distinguish found vs. missing.
+//
+// This allows the binary to replace the system vmware-rpctool (which may be
+// statically linked, bypassing LD_PRELOAD shims) while preserving full
+// cloud-init compatibility.
+func cmdRPCCmd(command string) error {
+	f, err := vsockDial(vmaddrCIDHost, rpciPort)
+	if err != nil {
+		// Channel failure: exit 1, no output — cloud-init will not identify VMware.
+		return err
+	}
+	defer f.Close()
+
+	resp, err := guestRPCRoundTrip(f, command)
+	if err != nil {
+		return err
+	}
+	// Print the raw response including the "1 " or "0 " prefix.  Cloud-init
+	// parses this itself to distinguish found vs. missing keys.
+	fmt.Println(resp)
+	return nil // always exit 0 for successful channel round-trips
+}
+
 // cmdBidi connects to port via AF_VSOCK and performs a bidirectional exchange:
 //  1. Reads a newline-terminated message from the host; verifies == wantFromHost.
 //  2. Sends sendToHost (newline-terminated) to the host.
@@ -265,6 +309,10 @@ Subcommands:
   grpc-roundtrip KEY VALUE
       Set KEY=VALUE and get it back, verifying the round-trip.
 
+  rpc-cmd COMMAND
+      Send COMMAND (e.g. "info-get guestinfo.KEY") to the GuestRPC server.
+      Prints the value on success; exits 1 on failure.
+
   bidi PORT WANT_FROM_HOST SEND_TO_HOST
       Connect to PORT, read WANT_FROM_HOST from host, send SEND_TO_HOST.
       Tests bidirectional communication through a custom port handler.`)
@@ -272,6 +320,23 @@ Subcommands:
 }
 
 func main() {
+	// vmware-rpctool compatibility mode: when the binary is installed under a
+	// name that contains "vmware-rpctool", treat the first argument as a raw
+	// GuestRPC command string (e.g. 'info-get guestinfo.metadata') and forward
+	// it to the GuestRPC server via AF_VSOCK.  This allows the binary to replace
+	// the system vmware-rpctool — which may be statically linked and therefore
+	// immune to LD_PRELOAD shims — without modifying the container image.
+	if strings.Contains(filepath.Base(os.Args[0]), "vmware-rpctool") {
+		if len(os.Args) != 2 {
+			fmt.Fprintln(os.Stderr, "usage: vmware-rpctool 'COMMAND'")
+			os.Exit(2)
+		}
+		if err := cmdRPCCmd(os.Args[1]); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
 	if len(os.Args) < 2 {
 		usage()
 	}
@@ -298,6 +363,13 @@ func main() {
 			os.Exit(2)
 		}
 		err = cmdGRPCRoundTrip(os.Args[2], os.Args[3])
+
+	case "rpc-cmd":
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: vmci-guest rpc-cmd 'COMMAND'")
+			os.Exit(2)
+		}
+		err = cmdRPCCmd(os.Args[2])
 
 	case "bidi":
 		if len(os.Args) != 5 {
