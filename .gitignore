@@ -15,3 +15,7 @@ dist/
 
 # Test binaries
 *.test
+
+# vmci simulation artifacts (built on-demand by simulator tests via go build)
+/vmci-guest
+/simulator/bin/

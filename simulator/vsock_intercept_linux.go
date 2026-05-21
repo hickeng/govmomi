@@ -646,6 +646,12 @@ func (vi *vsockIntercept) handleConnect(seccompFd int, notif *seccompNotif) {
 
 	vi.mu.Lock()
 	hostFd, ok := vi.tracked[pidFDKey{pid: tgid, fd: fd}]
+	if ok {
+		// Remove the entry now: the handler goroutine takes ownership of hostFd,
+		// and the (tgid, fd) pair becomes free for reuse once the container process
+		// closes its end of the socketpair.
+		delete(vi.tracked, pidFDKey{pid: tgid, fd: fd})
+	}
 	vi.mu.Unlock()
 
 	if !ok {
@@ -661,7 +667,7 @@ func (vi *vsockIntercept) handleConnect(seccompFd int, notif *seccompNotif) {
 	log.Printf("vsockIntercept %s: connect pid=%d fd=%d cid=%d port=%d",
 		vi.vmUID, notif.PID, fd, cid, port)
 
-	// Dispatch to port handler.  The handler runs in a goroutine and owns hostFd.
+	// Dispatch to port handler.  The handler goroutine takes ownership of hostFd.
 	handler := vi.reg.lookup(port)
 	if handler != nil {
 		go handler(vi.vmUID, hostFd, cid, port)

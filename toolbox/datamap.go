@@ -63,6 +63,8 @@ func ReadDataMapPacket(r io.Reader) (payload []byte, fastClose bool, err error) 
 				return
 			}
 			low := binary.BigEndian.Uint32(buf[:4])
+			// high32 (buf[4:8]) is intentionally ignored: all DataMap int64
+			// fields we care about (FIELD_TYPE, FIELD_FAST_CLOSE) fit in uint32.
 			buf = buf[8:]
 			if fieldID == GuestRPCFieldFastClose && low != 0 {
 				fastClose = true
@@ -125,6 +127,7 @@ func WriteDataMapPacket(w io.Writer, payload []byte, fastClose bool) error {
 	put32(DMFieldTypeString)
 	put32(GuestRPCFieldPayload)
 	put32(uint32(len(payload)))
+	// String body is variable-length so it can't use put32; copy + advance manually.
 	copy(buf[off:], payload)
 	off += len(payload)
 

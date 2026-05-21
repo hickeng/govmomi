@@ -77,10 +77,11 @@ func (c *VsockChannel) Stop() error {
 // packet containing payload. The connection is left open for the paired
 // Receive call. If a previous connection was not closed, it is closed first.
 //
-// Both socket() and connect() are issued as raw Linux syscalls so that the
-// vcsim seccomp filter can intercept them and inject a Unix socketpair FD in
-// place of the real AF_VSOCK FD. This is identical to the approach used by the
-// vmci-guest test binary and is required for the intercept chain to work.
+// socket() is called via syscall.Socket and connect() via syscall.Syscall;
+// both result in the kernel socket(2)/connect(2) system calls, making them
+// visible to the vcsim seccomp filter which replaces the AF_VSOCK FD with a
+// Unix socketpair. This is identical to the approach used by the vmci-guest
+// test binary and is required for the intercept chain to work.
 func (c *VsockChannel) Send(buf []byte) error {
 	if c.conn != nil {
 		_ = c.conn.Close()

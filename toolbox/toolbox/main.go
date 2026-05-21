@@ -2,35 +2,39 @@
 // The term "Broadcom" refers to Broadcom Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: Apache-2.0
 
-// toolbox is the govmomi guest-side agent binary.
+// toolbox is a GuestRPC agent binary built on the govmomi/toolbox library.
 //
-// It implements the VMware GuestRPC RPCI protocol and can be used both on real
-// ESX/Fusion/Workstation VMs (via the x86 backdoor channel) and inside
-// govmomi/simulator container-backed VMs (via AF_VSOCK + DataMap framing, where
-// the seccomp-based intercept transparently replaces the vsock FD with a Unix
-// socketpair connected to the GuestRPCServer).
+// It is intended to be embedded in guest processes (custom init processes,
+// container-backed VMs, test harnesses) that need VMware GuestRPC / guestinfo
+// functionality without linking to the full open-vm-tools stack.
 //
-// Transport selection:
+// # Transport selection
 //
-//	AF_VSOCK (DataMap) is tried first.  This works on:
-//	  • Real ESX VMs with the vmci kernel module loaded.
-//	  • govmomi/simulator container-backed VMs with RUN.vmci=true.
-//	If AF_VSOCK is unavailable, the binary falls back to the x86 backdoor (for
-//	real VM environments running on VMware hypervisors).
+// All modes (daemon, one-shot, rpctool) share the same selection logic:
+//
+//	1. AF_VSOCK with DataMap framing is tried first.  Works on:
+//	   • Real ESX VMs with the vmci kernel module loaded.
+//	   • govmomi/simulator container-backed VMs (RUN.vmci=true via seccomp
+//	     intercept that replaces the vsock FD with a Unix socketpair).
+//	2. x86 backdoor channel (in eax,dx / port 0x5658) is used as fallback
+//	   when AF_VSOCK is unavailable (VMware Workstation/Fusion, or ESX VMs
+//	   without the vmci kernel module).
+//
+// Errors from channel open are always reported to stderr; the binary never
+// fails silently.
 //
 // # Invocation modes
 //
 // Daemon mode (no --cmd):
 //
-//	toolbox            — register capabilities + poll TCLO (vsock) / backdoor
+//	toolbox            — register capabilities + poll TCLO (vsock or backdoor)
 //
-// One-shot RPCI mode:
+// One-shot RPCI mode (vmtoolsd --cmd semantics):
 //
 //	toolbox --cmd "info-get guestinfo.KEY"
 //	toolbox --cmd "info-set guestinfo.KEY VALUE"
 //	toolbox --cmd "RPCI_COMMAND"
 //
-//	In vmtoolsd --cmd semantics:
 //	  • info-get: print bare value to stdout; exit 0 on found, exit 1 on missing.
 //	  • info-set: exit 0 on success, exit 1 on failure.
 //	  • capability / state RPCs: exit 0 immediately (no server round-trip needed).
@@ -44,19 +48,6 @@
 //	exits 0 on a successful channel round-trip (including "0 No value found").
 //	Exits 1 only on channel failure.  This matches the real vmware-rpctool
 //	contract that cloud-init DataSourceVMware relies on.
-//
-// # Container injection
-//
-// Build a static linux/amd64 binary and volume-overlay it into the container:
-//
-//	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-//	  -o /tmp/toolbox \
-//	  github.com/vmware/govmomi/toolbox/toolbox
-//
-// Then in ExtraConfig:
-//
-//	"RUN.volume.vmtoolsd":     "/tmp/toolbox:/usr/bin/vmtoolsd:ro",
-//	"RUN.volume.vmware-rpc":   "/tmp/toolbox:/usr/bin/vmware-rpctool:ro",
 package main
 
 import (
@@ -82,6 +73,7 @@ func main() {
 			os.Exit(2)
 		}
 		if err := rpcCmd(os.Args[1]); err != nil {
+			fmt.Fprintf(os.Stderr, "vmware-rpctool: %v\n", err)
 			os.Exit(1)
 		}
 		return
@@ -92,6 +84,7 @@ func main() {
 
 	if *cmdArg != "" {
 		if err := vmtoolsdCmd(*cmdArg); err != nil {
+			fmt.Fprintf(os.Stderr, "vmtoolsd: %v\n", err)
 			os.Exit(1)
 		}
 		return
@@ -120,22 +113,37 @@ func main() {
 	service.Wait()
 }
 
-// selectChannels returns (in, out) channels for the daemon mode.
-//
-// Preference: AF_VSOCK (VsockChannel + NoopChannelIn) for both simulated and
-// real ESX environments. toolbox.IsVsockAvailable() probes socket(AF_VSOCK)
-// without opening a connection; it returns true on:
-//   - Real ESX VMs with the vmci kernel module loaded.
-//   - govmomi/simulator container-backed VMs with RUN.vmci=true (seccomp intercept).
-//
-// On non-Linux, bare containers, or non-VM hosts, IsVsockAvailable returns false
-// and the backdoor fallback is used.
+// selectChannels returns (in, out) channels for daemon mode using the same
+// preference order as openRPCChannel: AF_VSOCK first, backdoor as fallback.
 func selectChannels() (toolbox.Channel, toolbox.Channel) {
 	if toolbox.IsVsockAvailable() {
 		return toolbox.NewNoopChannelIn(), toolbox.NewVsockChannelOut()
 	}
-	// Fallback: traditional VMware x86 backdoor (real VM on ESX/Fusion/Workstation).
 	return toolbox.NewBackdoorChannelIn(), toolbox.NewBackdoorChannelOut()
+}
+
+// openRPCChannel returns the best available GuestRPC outbound channel.
+//
+// Selection order:
+//  1. AF_VSOCK (DataMap framing) — works on real ESX VMs with the vmci kernel
+//     module and on govmomi/simulator container-backed VMs (RUN.vmci=true).
+//  2. x86 backdoor — works on VMware Workstation/Fusion and ESX VMs without
+//     the vmci module.
+//
+// Returns a non-nil error (with a descriptive message) if neither transport
+// can be opened; the binary never fails silently.
+func openRPCChannel() (toolbox.Channel, error) {
+	if toolbox.IsVsockAvailable() {
+		ch := toolbox.NewVsockChannelOut()
+		if err := ch.Start(); err == nil {
+			return ch, nil
+		}
+	}
+	ch := toolbox.NewBackdoorChannelOut()
+	if err := ch.Start(); err != nil {
+		return nil, fmt.Errorf("GuestRPC channel unavailable: AF_VSOCK not present and backdoor failed: %w", err)
+	}
+	return ch, nil
 }
 
 // rpcCmd sends a raw GuestRPC command and prints the raw server response
@@ -143,20 +151,22 @@ func selectChannels() (toolbox.Channel, toolbox.Channel) {
 //
 // Exit semantics match the real vmware-rpctool binary:
 //   - Exit 0 + print response on a successful channel round-trip.
-//   - Exit 1 (no output) on channel failure (connect error, I/O error).
+//   - Exit 1 + message on stderr on channel failure (connect error, I/O error).
 //
 // cloud-init DataSourceVMware calls vmware-rpctool and checks:
 //   - "1 " prefix → VMware environment, datasource active.
 //   - "0 " prefix or exit 1 → not VMware / key missing, datasource deactivates.
 func rpcCmd(command string) error {
-	out := toolbox.NewVsockChannelOut()
-	if err := out.Start(); err != nil {
+	ch, err := openRPCChannel()
+	if err != nil {
 		return err
 	}
-	if err := out.Send([]byte(command)); err != nil {
+	defer ch.Stop()
+
+	if err := ch.Send([]byte(command)); err != nil {
 		return err
 	}
-	reply, err := out.Receive()
+	reply, err := ch.Receive()
 	if err != nil {
 		return err
 	}
@@ -171,27 +181,30 @@ func rpcCmd(command string) error {
 //   - info-set KEY VAL: exit 0 on success, exit 1 on failure.
 //   - tools.* / Capabilities_Register / Set_Option: acknowledge, exit 0.
 //   - other RPCs: exit 0 on "1 ..." response, exit 1 on "0 ..." response.
+//   - channel failure: exit 1 + message on stderr.
 func vmtoolsdCmd(command string) error {
 	command = strings.TrimSpace(command)
 
-	// Capability and state RPCs do not require a server round-trip.
+	// Capability and state RPCs are acknowledged without a server round-trip.
+	// The real vmtoolsd also short-circuits these in some configurations.
 	if strings.HasPrefix(command, "tools.") ||
 		strings.HasPrefix(command, "Capabilities_Register") ||
 		strings.HasPrefix(command, "Set_Option ") {
 		return nil
 	}
 
-	out := toolbox.NewVsockChannelOut()
-	if err := out.Start(); err != nil {
+	ch, err := openRPCChannel()
+	if err != nil {
 		return err
 	}
-	ch := &toolbox.ChannelOut{Channel: out}
+	defer ch.Stop()
+	rpci := &toolbox.ChannelOut{Channel: ch}
 
 	if strings.HasPrefix(command, "info-get ") {
 		// info-get: exit 0 + print bare value on success; exit 1 on missing.
 		// ChannelOut.Request strips the "1 " prefix on success and returns
 		// an error (wrapping the "0 ..." response) on failure.
-		val, err := ch.Request([]byte(command))
+		val, err := rpci.Request([]byte(command))
 		if err != nil {
 			return err
 		}
@@ -201,6 +214,6 @@ func vmtoolsdCmd(command string) error {
 	}
 
 	// info-set and everything else: success = "1 ...", failure = "0 ...".
-	_, err := ch.Request([]byte(command))
+	_, err = rpci.Request([]byte(command))
 	return err
 }

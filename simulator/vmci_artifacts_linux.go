@@ -16,10 +16,10 @@ import (
 )
 
 var (
-	vmciShimOnce         sync.Once
-	vmciShimGuestBinPath string
-	vmciShimToolboxPath  string
-	vmciShimErr          error
+	vmciArtifactsOnce         sync.Once
+	vmciArtifactsGuestPath string
+	vmciArtifactsToolboxPath  string
+	vmciArtifactsErr          error
 )
 
 // buildVmciArtifacts builds the Go binaries needed for VMCI simulation once per
@@ -33,10 +33,10 @@ var (
 //
 // Both builds require only the Go toolchain.
 func buildVmciArtifacts() (guestBinPath, toolboxBinPath string, err error) {
-	vmciShimOnce.Do(func() {
-		dir, mkErr := os.MkdirTemp("", "vcsim-vmci-shim-*")
+	vmciArtifactsOnce.Do(func() {
+		dir, mkErr := os.MkdirTemp("", "vcsim-vmci-artifacts-*")
 		if mkErr != nil {
-			vmciShimErr = mkErr
+			vmciArtifactsErr = mkErr
 			return
 		}
 
@@ -54,10 +54,10 @@ func buildVmciArtifacts() (guestBinPath, toolboxBinPath string, err error) {
 			"GOARCH=amd64",
 		)
 		if out, buildErr := goBuild.CombinedOutput(); buildErr != nil {
-			vmciShimErr = fmt.Errorf("vmci-guest build: %w\n%s", buildErr, out)
+			vmciArtifactsErr = fmt.Errorf("vmci-guest build: %w\n%s", buildErr, out)
 			return
 		}
-		vmciShimGuestBinPath = guestBin
+		vmciArtifactsGuestPath = guestBin
 		log.Printf("vmci-artifacts: built vmci-guest at %s", guestBin)
 
 		// Build the govmomi/toolbox binary.  Injected at /usr/bin/vmware-rpctool
@@ -75,13 +75,18 @@ func buildVmciArtifacts() (guestBinPath, toolboxBinPath string, err error) {
 			"GOARCH=amd64",
 		)
 		if out, buildErr := toolboxBuild.CombinedOutput(); buildErr != nil {
+			// Non-fatal: toolbox failure only skips the /usr/bin/vmware-rpctool
+			// auto-injection.  Tests can still inject the binary explicitly via
+			// RUN.volume.  vmci-guest (the test agent) is always required; its
+			// build failure is fatal (sets vmciArtifactsErr) and prevents any
+			// injection.
 			log.Printf("vmci-artifacts: toolbox build failed (%v); vmware-rpctool auto-injection skipped\n%s", buildErr, out)
 		} else {
-			vmciShimToolboxPath = toolboxBin
+			vmciArtifactsToolboxPath = toolboxBin
 			log.Printf("vmci-artifacts: built toolbox at %s", toolboxBin)
 		}
 	})
-	return vmciShimGuestBinPath, vmciShimToolboxPath, vmciShimErr
+	return vmciArtifactsGuestPath, vmciArtifactsToolboxPath, vmciArtifactsErr
 }
 
 // VmciToolboxBinaryPath returns the host path of the govmomi/toolbox static

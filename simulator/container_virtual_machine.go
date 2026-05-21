@@ -39,13 +39,12 @@
 //   - RUN.env.<name>: Set environment variable in the container.
 //     Example: RUN.env.DEBUG = "true" sets DEBUG=true in the container.
 //
-//   - guestinfo.*: Passed as VMX_GUESTINFO_* environment variables.
-//     VMX_GUESTINFO=true is always set so cloud-init can use the env-var
-//     transport (DataSourceVMwareGuestInfo) as a reliable fallback when the
-//     Python vmtools library inside the container cannot reach the backdoor.
-//     With RUN.vmci=true, in-container write operations (e.g. bootstrapper
-//     writing guestinfo.supervisor.enable.status) still go through GuestRPC
-//     via the vmci-guest binary injected at /usr/bin/vmware-rpctool.
+//   - guestinfo.*: Each key is exposed as a VMX_GUESTINFO_* environment
+//     variable and VMX_GUESTINFO=true is set so cloud-init's DataSourceVMware
+//     uses the envvar seed (cloud-init's container detection always skips the
+//     guestinfo transport).  With RUN.vmci=true the GuestRPC server also
+//     serves these keys via info-get for in-container write-back (e.g. the
+//     bootstrapper writing guestinfo.supervisor.enable.status).
 //
 // # Example: Basic Container
 //
@@ -422,18 +421,21 @@ func (svm *simVM) start(ctx *Context) error {
 	}
 
 	if len(env) != 0 {
-		// VMX_GUESTINFO=true tells cloud-init-vmware-guestinfo to use the
-		// env-var transport (DataSourceVMwareGuestInfo).
+		// VMX_GUESTINFO=true activates DataSourceVMware's envvar seed so that
+		// cloud-init reads guestinfo from VMX_GUESTINFO_* environment variables.
 		//
-		// We set this even when RUN.vmci=true because cloud-init's primary
-		// DataSourceVMware (using Python vmtools library) can fail in containers
-		// where the Python library triggers ioctls that our shim doesn't
-		// emulate.  cloud-init falls back to DataSourceVMwareGuestInfo, which
-		// reads the VMX_GUESTINFO_* env vars set below — reliable and fast.
+		// The guestinfo transport (cloud-init calling vmware-rpctool as a
+		// subprocess) is always skipped in containers: cloud-init's
+		// read_dmi_data() returns nil for containers (it calls is_container(),
+		// which detects the podman environment via /run/systemd/container and
+		// container= in PID 1's environ), so is_vmware_platform() always returns
+		// false, and the guestinfo transport's require_vmware_platform guard
+		// skips it.  The envvar seed (require_vmware_platform=false) is therefore
+		// the only transport cloud-init will use in a container.
 		//
 		// In-container WRITE operations (e.g. bootstrapper writing
-		// guestinfo.supervisor.enable.status) use GuestRPC via the
-		// toolbox binary auto-injected at /usr/bin/vmware-rpctool.
+		// guestinfo.supervisor.enable.status) use GuestRPC via the toolbox
+		// binary auto-injected at /usr/bin/vmware-rpctool.
 		env = append(env, "VMX_GUESTINFO=true")
 	}
 
@@ -464,7 +466,11 @@ func (svm *simVM) start(ctx *Context) error {
 		} else {
 			// Inject the vmci-guest static binary at /vmci-guest for test
 			// subcommands (grpc-set, grpc-get, bidi, …).
-			extraVolumes = append(extraVolumes, guestBin+":/vmci-guest:ro")
+			// Skip if the caller has already bound this destination explicitly
+			// (e.g. TestContainerGuestRPC_VsockIntercept which builds its own copy).
+			if !hasVolumeDest(svm.vm.Config.ExtraConfig, "/vmci-guest") {
+				extraVolumes = append(extraVolumes, guestBin+":/vmci-guest:ro")
+			}
 
 			// Inject the govmomi/toolbox binary at /usr/bin/vmware-rpctool.
 			// It uses AF_VSOCK + DataMap framing (no backdoor instruction) and

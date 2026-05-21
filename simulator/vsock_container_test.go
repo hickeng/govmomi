@@ -52,9 +52,20 @@ import (
 // buildToolboxBinary builds the govmomi/toolbox binary as a static linux/amd64
 // binary.  It is the canonical vmtoolsd / vmware-rpctool replacement for
 // container-backed VMs in vcsim tests.
+// buildToolboxBinary returns the path to the cached govmomi/toolbox binary,
+// sharing the build with the simulator's own buildVmciArtifacts (sync.Once).
+// This avoids a second independent "go build" when RUN.vmci=true is set,
+// which would also trigger buildVmciArtifacts during PowerOn.
 func buildToolboxBinary(t *testing.T) string {
 	t.Helper()
-	return buildStaticBinary(t, "github.com/vmware/govmomi/toolbox/toolbox", "toolbox")
+	_, path, err := buildVmciArtifacts()
+	if err != nil {
+		t.Skipf("vmci artifact build failed: %v", err)
+	}
+	if path == "" {
+		t.Skip("toolbox binary unavailable (govmomi/toolbox build may have been skipped)")
+	}
+	return path
 }
 
 // dockerExec runs "docker exec containerID args..." and returns trimmed stdout.
