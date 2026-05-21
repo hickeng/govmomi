@@ -457,62 +457,21 @@ func (svm *simVM) start(ctx *Context) error {
 		extraVolumes = append(extraVolumes, guestRPCVolumeMount(socketPath))
 		env = append(env, "VMX_RPC_SOCK="+GuestRPCSocketName)
 
-		// Auto-inject the LD_PRELOAD backdoor shim unless the caller already
-		// set LD_PRELOAD explicitly (via RUN.env.LD_PRELOAD in ExtraConfig).
-		//
-		// Two artefacts are mounted into the container:
-		//   1. /vmci-backdoor-shim.so  — the LD_PRELOAD target; overrides
-		//      VMware backdoor and VMCISock functions so vmtoolsd does not
-		//      execute the x86 IN instruction (SIGILL in containers).
-		//   2. /etc/systemd/system.conf.d/vmci-shim.conf — systemd Manager
-		//      drop-in that sets DefaultEnvironment=LD_PRELOAD=…; required
-		//      because systemd does NOT forward PID1's environment to the
-		//      services it spawns (vmtoolsd, cloud-init, bootstrapper).
-		//      Docker/Podman create the parent directory if absent, so this
-		//      mount is safe in both systemd and non-systemd containers.
-		shimSo, shimConf, guestBin, toolboxBin, shimBuildErr := buildVmciShim()
+		// Build the vmci-guest test agent and the toolbox binary (once per process).
+		guestBin, toolboxBin, shimBuildErr := buildVmciArtifacts()
 		if shimBuildErr != nil {
-			log.Printf("%s: vmci shim build failed (%v); vmtoolsd/vmware-rpctool will not work", svm.vm.Name, shimBuildErr)
+			log.Printf("%s: vmci artifact build failed (%v); vmware-rpctool auto-injection skipped", svm.vm.Name, shimBuildErr)
 		} else {
 			// Inject the vmci-guest static binary at /vmci-guest for test
 			// subcommands (grpc-set, grpc-get, bidi, …).
 			extraVolumes = append(extraVolumes, guestBin+":/vmci-guest:ro")
 
 			// Inject the govmomi/toolbox binary at /usr/bin/vmware-rpctool.
-			// The toolbox binary uses AF_VSOCK + DataMap framing (no backdoor
-			// instruction) and is compatible with both vcsim AF_VSOCK intercept
-			// and real ESX hypervisors.  This overrides the system vmware-rpctool
-			// (which is often statically linked and cannot be LD_PRELOAD-patched),
-			// ensuring cloud-init can read guestinfo reliably.
-			// If the caller has explicitly provided a RUN.volume entry targeting
-			// /usr/bin/vmware-rpctool, that entry takes precedence because
-			// RUN.volume entries are appended before extraVolumes in the final
-			// -v flag list; duplicate mount destinations would fail at container
-			// create time.  To avoid that, we skip auto-injection only if the
-			// caller's ExtraConfig already targets that path.
+			// It uses AF_VSOCK + DataMap framing (no backdoor instruction) and
+			// works with both the vcsim seccomp intercept and real ESX.
+			// Skip if the caller already bound this destination explicitly.
 			if toolboxBin != "" && !hasVolumeDest(svm.vm.Config.ExtraConfig, "/usr/bin/vmware-rpctool") {
 				extraVolumes = append(extraVolumes, toolboxBin+":/usr/bin/vmware-rpctool:ro")
-			}
-
-			// Inject the systemd Manager drop-in that propagates LD_PRELOAD to
-			// services started by systemd.  Required when the system vmtoolsd is
-			// dynamically linked and relies on the shim for backdoor suppression.
-			// Harmless when the toolbox binary is used instead (it ignores LD_PRELOAD).
-			extraVolumes = append(extraVolumes,
-				shimConf+":/etc/systemd/system.conf.d/vmci-shim.conf:ro",
-			)
-			// LD_PRELOAD for dynamically-linked binaries (vmtoolsd, etc.).
-			// Skip injection if the caller already set LD_PRELOAD explicitly.
-			alreadyHasLDPreload := false
-			for _, e := range env {
-				if strings.HasPrefix(e, "LD_PRELOAD=") {
-					alreadyHasLDPreload = true
-					break
-				}
-			}
-			if !alreadyHasLDPreload && shimSo != "" {
-				extraVolumes = append(extraVolumes, shimSo+":/vmci-backdoor-shim.so:ro")
-				env = append(env, "LD_PRELOAD=/vmci-backdoor-shim.so")
 			}
 		}
 	}

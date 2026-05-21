@@ -377,7 +377,7 @@ func TestVMCI_ToolboxBinary_GuestInfoRoundTrip(t *testing.T) {
 
 	// ── Create container-backed VM ────────────────────────────────────────
 	// Overlay the toolbox binary as /usr/bin/vmtoolsd (explicit RUN.volume).
-	// /usr/bin/vmware-rpctool is auto-injected by buildVmciShim (RUN.vmci=true).
+	// /usr/bin/vmware-rpctool is auto-injected by buildVmciArtifacts (RUN.vmci=true).
 	// Both dispatch on filepath.Base(os.Args[0]).
 	const key = "guestinfo.toolbox-roundtrip"
 	const val = "hello-from-toolbox"
@@ -393,7 +393,7 @@ func TestVMCI_ToolboxBinary_GuestInfoRoundTrip(t *testing.T) {
 			&types.OptionValue{Key: "RUN.vmci", Value: "true"},
 			// Inject the toolbox binary as /usr/bin/vmtoolsd so vmtoolsd --cmd
 			// dispatches on filepath.Base(os.Args[0]) = "vmtoolsd".
-			// /usr/bin/vmware-rpctool is auto-injected by buildVmciShim when
+			// /usr/bin/vmware-rpctool is auto-injected by buildVmciArtifacts when
 			// RUN.vmci=true; no explicit RUN.volume entry needed for it.
 			&types.OptionValue{
 				Key:   "RUN.volume.vmtoolsd",
