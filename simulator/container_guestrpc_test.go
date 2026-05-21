@@ -90,7 +90,7 @@ func buildVmciGuestBinary(t *testing.T) string {
 // before proceeding (e.g. to log a clearer skip reason than "poll timed out").
 func skipIfNoVmciShim(t *testing.T) {
 	t.Helper()
-	if _, _, _, err := buildVmciShim(); err != nil {
+	if _, _, _, _, err := buildVmciShim(); err != nil {
 		t.Skipf("vmci-backdoor-shim unavailable (%v); skipping vmtoolsd test", err)
 	}
 }

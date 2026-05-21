@@ -432,8 +432,8 @@ func (svm *simVM) start(ctx *Context) error {
 		// reads the VMX_GUESTINFO_* env vars set below — reliable and fast.
 		//
 		// In-container WRITE operations (e.g. bootstrapper writing
-		// guestinfo.supervisor.enable.status) still use GuestRPC via the
-		// vmci-guest binary injected at /usr/bin/vmware-rpctool.
+		// guestinfo.supervisor.enable.status) use GuestRPC via the
+		// toolbox binary auto-injected at /usr/bin/vmware-rpctool.
 		env = append(env, "VMX_GUESTINFO=true")
 	}
 
@@ -470,19 +470,35 @@ func (svm *simVM) start(ctx *Context) error {
 		//      services it spawns (vmtoolsd, cloud-init, bootstrapper).
 		//      Docker/Podman create the parent directory if absent, so this
 		//      mount is safe in both systemd and non-systemd containers.
-		shimSo, shimConf, guestBin, shimBuildErr := buildVmciShim()
+		shimSo, shimConf, guestBin, toolboxBin, shimBuildErr := buildVmciShim()
 		if shimBuildErr != nil {
 			log.Printf("%s: vmci shim build failed (%v); vmtoolsd/vmware-rpctool will not work", svm.vm.Name, shimBuildErr)
 		} else {
-			// Inject the vmci-guest static binary at two paths:
-			//   /vmci-guest              — test subcommands (grpc-set, grpc-get, …)
-			//   /usr/bin/vmware-rpctool  — overrides the system vmware-rpctool;
-			//     cloud-init calls this to read guestinfo.metadata/userdata.
-			//     The system binary is often statically linked so LD_PRELOAD never
-			//     applies; our binary talks to the GuestRPC unix socket directly.
+			// Inject the vmci-guest static binary at /vmci-guest for test
+			// subcommands (grpc-set, grpc-get, bidi, …).
+			extraVolumes = append(extraVolumes, guestBin+":/vmci-guest:ro")
+
+			// Inject the govmomi/toolbox binary at /usr/bin/vmware-rpctool.
+			// The toolbox binary uses AF_VSOCK + DataMap framing (no backdoor
+			// instruction) and is compatible with both vcsim AF_VSOCK intercept
+			// and real ESX hypervisors.  This overrides the system vmware-rpctool
+			// (which is often statically linked and cannot be LD_PRELOAD-patched),
+			// ensuring cloud-init can read guestinfo reliably.
+			// If the caller has explicitly provided a RUN.volume entry targeting
+			// /usr/bin/vmware-rpctool, that entry takes precedence because
+			// RUN.volume entries are appended before extraVolumes in the final
+			// -v flag list; duplicate mount destinations would fail at container
+			// create time.  To avoid that, we skip auto-injection only if the
+			// caller's ExtraConfig already targets that path.
+			if toolboxBin != "" && !hasVolumeDest(svm.vm.Config.ExtraConfig, "/usr/bin/vmware-rpctool") {
+				extraVolumes = append(extraVolumes, toolboxBin+":/usr/bin/vmware-rpctool:ro")
+			}
+
+			// Inject the systemd Manager drop-in that propagates LD_PRELOAD to
+			// services started by systemd.  Required when the system vmtoolsd is
+			// dynamically linked and relies on the shim for backdoor suppression.
+			// Harmless when the toolbox binary is used instead (it ignores LD_PRELOAD).
 			extraVolumes = append(extraVolumes,
-				guestBin+":/vmci-guest:ro",
-				guestBin+":/usr/bin/vmware-rpctool:ro",
 				shimConf+":/etc/systemd/system.conf.d/vmci-shim.conf:ro",
 			)
 			// LD_PRELOAD for dynamically-linked binaries (vmtoolsd, etc.).

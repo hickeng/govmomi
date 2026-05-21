@@ -11,6 +11,10 @@ import "errors"
 // buildVmciShim is a no-op stub on non-Linux platforms.
 // The VMCI shim is only meaningful on Linux where the seccomp AF_VSOCK
 // interception runs.
-func buildVmciShim() (soPath, confPath, guestBinPath string, err error) {
-	return "", "", "", errors.New("vmci-backdoor-shim: only available on linux")
+func buildVmciShim() (soPath, confPath, guestBinPath, toolboxBinPath string, err error) {
+	return "", "", "", "", errors.New("vmci-backdoor-shim: only available on linux")
 }
+
+// VmciToolboxBinaryPath returns "" on non-Linux platforms where VMCI simulation
+// is not supported.
+func VmciToolboxBinaryPath() string { return "" }

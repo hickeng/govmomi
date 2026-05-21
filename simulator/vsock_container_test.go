@@ -49,6 +49,14 @@ import (
 	"github.com/vmware/govmomi/vim25/types"
 )
 
+// buildToolboxBinary builds the govmomi/toolbox binary as a static linux/amd64
+// binary.  It is the canonical vmtoolsd / vmware-rpctool replacement for
+// container-backed VMs in vcsim tests.
+func buildToolboxBinary(t *testing.T) string {
+	t.Helper()
+	return buildStaticBinary(t, "github.com/vmware/govmomi/toolbox/toolbox", "toolbox")
+}
+
 // dockerExec runs "docker exec containerID args..." and returns trimmed stdout.
 // Stderr from docker exec (including podman compatibility warnings) is isolated
 // and only included in the failure message, not in the return value.
@@ -303,6 +311,166 @@ func TestVMCI_ContainerBidirectional(t *testing.T) {
 	// first; the SIGTERM trap ensures docker stop completes in < 1 s.
 	// vsockVI.Stop() has a 15 s belt-and-suspenders timeout for goroutines
 	// blocked in SECCOMP_IOCTL_NOTIF_RECV (crun cleanup may outlive the container).
+	t.Run("stop", func(t *testing.T) {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		offTask, err := vm.PowerOff(stopCtx)
+		require.NoError(t, err)
+		require.NoError(t, offTask.Wait(stopCtx),
+			"PowerOff must complete within 60 s — vsockVI.Stop() may have deadlocked")
+
+		t.Logf("PowerOff completed; vsockVI.Stop() did not deadlock")
+
+		vi.stopMu.Lock()
+		stopped := vi.stopped
+		vi.stopMu.Unlock()
+		require.True(t, stopped, "vsockIntercept must be marked stopped after PowerOff")
+	})
+}
+
+// TestVMCI_ToolboxBinary_GuestInfoRoundTrip validates that the govmomi/toolbox
+// binary, when volume-overlaid as /usr/bin/vmtoolsd and /usr/bin/vmware-rpctool
+// in a container-backed VM, correctly reads and writes guestinfo through the
+// vcsim AF_VSOCK intercept + GuestRPC server.
+//
+// This test is the acceptance gate for D-97-14 and FU-97-10:
+//
+//   - D-97-14: toolbox binary is the vmtoolsd/vmware-rpctool replacement.
+//   - FU-97-10 (CLOSED): toolbox now supports DataMap framing via VsockChannel,
+//     making the binary compatible with both vcsim (AF_VSOCK intercept) and
+//     real ESX hypervisors (native AF_VSOCK).
+//
+// Subtests:
+//  1. vmtoolsd-info-set: info-set KEY VAL → value visible in ExtraConfig.
+//  2. vmtoolsd-info-get: info-get KEY → bare value printed to stdout, exit 0.
+//  3. vmware-rpctool-info-get: raw "1 VALUE" response, exit 0 (cloud-init contract).
+//  4. vmtoolsd-info-get-missing: missing key → exit 1, no stdout (cloud-init contract).
+//  5. stop: PowerOff completes cleanly, vsockVI stopped.
+func TestVMCI_ToolboxBinary_GuestInfoRoundTrip(t *testing.T) {
+	if !test.HasDocker() {
+		t.Skip("requires docker or podman (aliased as docker) on linux")
+	}
+
+	// ── Build the toolbox binary ──────────────────────────────────────────
+	toolboxBin := buildToolboxBinary(t)
+
+	// ── Stand up vcsim ────────────────────────────────────────────────────
+	goCtx := context.Background()
+	m := VPX()
+	defer m.Remove()
+	require.NoError(t, m.Create())
+	s := m.Service.NewServer()
+	defer s.Close()
+	simCtx := m.Service.Context
+
+	c, err := govmomi.NewClient(goCtx, s.URL, true)
+	require.NoError(t, err)
+
+	finder := find.NewFinder(c.Client)
+	pool, err := finder.ResourcePool(goCtx, "DC0_H0/Resources")
+	require.NoError(t, err)
+	dc, err := finder.Datacenter(goCtx, "DC0")
+	require.NoError(t, err)
+	f, err := dc.Folders(goCtx)
+	require.NoError(t, err)
+
+	// ── Create container-backed VM ────────────────────────────────────────
+	// Overlay the toolbox binary as /usr/bin/vmtoolsd (explicit RUN.volume).
+	// /usr/bin/vmware-rpctool is auto-injected by buildVmciShim (RUN.vmci=true).
+	// Both dispatch on filepath.Base(os.Args[0]).
+	const key = "guestinfo.toolbox-roundtrip"
+	const val = "hello-from-toolbox"
+
+	spec := types.VirtualMachineConfigSpec{
+		Name:  "toolbox-roundtrip-test",
+		Files: &types.VirtualMachineFileInfo{VmPathName: "[LocalDS_0] toolbox-roundtrip-test"},
+		ExtraConfig: []types.BaseOptionValue{
+			&types.OptionValue{
+				Key:   ContainerBackingOptionKey,
+				Value: `["alpine","sh","-c","trap exit SIGTERM; sleep infinity & wait"]`,
+			},
+			&types.OptionValue{Key: "RUN.vmci", Value: "true"},
+			// Inject the toolbox binary as /usr/bin/vmtoolsd so vmtoolsd --cmd
+			// dispatches on filepath.Base(os.Args[0]) = "vmtoolsd".
+			// /usr/bin/vmware-rpctool is auto-injected by buildVmciShim when
+			// RUN.vmci=true; no explicit RUN.volume entry needed for it.
+			&types.OptionValue{
+				Key:   "RUN.volume.vmtoolsd",
+				Value: toolboxBin + ":/usr/bin/vmtoolsd:ro",
+			},
+		},
+	}
+	require.NoError(t, test.ApplyContainerRuntimeDefaults(&spec))
+
+	task, err := f.VmFolder.CreateVM(goCtx, spec, pool, nil)
+	require.NoError(t, err)
+	info, err := task.WaitForResult(goCtx, nil)
+	require.NoError(t, err)
+
+	vmRef := info.Result.(types.ManagedObjectReference)
+	vm := object.NewVirtualMachine(c.Client, vmRef)
+
+	powerTask, err := vm.PowerOn(goCtx)
+	require.NoError(t, err)
+	require.NoError(t, powerTask.Wait(goCtx))
+
+	vmObj := simCtx.Map.Get(vmRef).(*VirtualMachine)
+	vi := waitForVsockReady(t, simCtx, vmObj, 30*time.Second)
+	containerID := containerIDFor(t, simCtx, vmObj)
+
+	// ── TEST 1: vmtoolsd --cmd info-set ───────────────────────────────────
+	t.Run("vmtoolsd-info-set", func(t *testing.T) {
+		// info-set exits 0 and produces no stdout on success.
+		dockerExec(t, goCtx, containerID,
+			"vmtoolsd", "--cmd", "info-set "+key+" "+val)
+
+		got := readGuestInfoKey(simCtx, vmObj, key)
+		require.Equal(t, val, got,
+			"ExtraConfig key %q must be set after vmtoolsd --cmd info-set", key)
+	})
+
+	// ── TEST 2: vmtoolsd --cmd info-get ───────────────────────────────────
+	t.Run("vmtoolsd-info-get", func(t *testing.T) {
+		// info-get exits 0 and prints the bare value (no "1 " prefix).
+		out := dockerExec(t, goCtx, containerID,
+			"vmtoolsd", "--cmd", "info-get "+key)
+		require.Equal(t, val, out,
+			"vmtoolsd --cmd info-get must print bare value")
+	})
+
+	// ── TEST 3: vmware-rpctool info-get ───────────────────────────────────
+	t.Run("vmware-rpctool-info-get", func(t *testing.T) {
+		// vmware-rpctool prints the raw "1 VALUE" or "0 ..." response and
+		// always exits 0 on a successful channel round-trip.  cloud-init
+		// parses the "1 " prefix itself.
+		out := dockerExec(t, goCtx, containerID,
+			"vmware-rpctool", "info-get "+key)
+		require.Equal(t, "1 "+val, out,
+			"vmware-rpctool info-get must print raw '1 VALUE' response")
+	})
+
+	// ── TEST 4: vmtoolsd info-get missing key → exit 1 ───────────────────
+	// Verifies the exit-code contract that cloud-init DataSourceVMware depends on:
+	// exit 0 = key found, exit 1 = key missing or channel error.
+	t.Run("vmtoolsd-info-get-missing", func(t *testing.T) {
+		cmd := exec.CommandContext(goCtx, "docker",
+			"exec", containerID,
+			"vmtoolsd", "--cmd", "info-get guestinfo.nonexistent.key")
+		out, err := cmd.Output()
+
+		var exitErr *exec.ExitError
+		require.ErrorAs(t, err, &exitErr,
+			"vmtoolsd info-get for a missing key must exit non-zero")
+		require.Equal(t, 1, exitErr.ExitCode(),
+			"vmtoolsd info-get for a missing key must exit 1")
+		require.Empty(t, strings.TrimSpace(string(out)),
+			"vmtoolsd info-get for a missing key must produce no stdout")
+	})
+
+	// ── TEST 5: Stop path ─────────────────────────────────────────────────
+	// Mirrors the identical check in TestVMCI_ContainerBidirectional:
+	// vsockVI.Stop() must be called and vi.stopped must be true after PowerOff.
 	t.Run("stop", func(t *testing.T) {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()

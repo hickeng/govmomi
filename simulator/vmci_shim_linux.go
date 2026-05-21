@@ -32,27 +32,30 @@ var vmciShimSrc []byte
 const systemdDefaultEnvConf = "[Manager]\nDefaultEnvironment=LD_PRELOAD=/vmci-backdoor-shim.so\n"
 
 var (
-	vmciShimOnce        sync.Once
-	vmciShimSoPath      string
-	vmciShimConfPath    string
+	vmciShimOnce         sync.Once
+	vmciShimSoPath       string
+	vmciShimConfPath     string
 	vmciShimGuestBinPath string
-	vmciShimErr         error
+	vmciShimToolboxPath  string
+	vmciShimErr          error
 )
 
 // buildVmciShim compiles the LD_PRELOAD shim once per process and returns the
 // paths to:
-//   - soPath:      vmci-backdoor-shim.so  (LD_PRELOAD target inside the container)
-//   - confPath:    vmci-shim.conf         (systemd DefaultEnvironment drop-in)
-//   - guestBinPath vmci-guest             (static binary; also injected as vmware-rpctool)
+//   - soPath:          vmci-backdoor-shim.so  (LD_PRELOAD target inside the container)
+//   - confPath:        vmci-shim.conf         (systemd DefaultEnvironment drop-in)
+//   - guestBinPath:    vmci-guest             (test agent binary; injected at /vmci-guest)
+//   - toolboxBinPath:  toolbox                (govmomi/toolbox binary; injected as vmware-rpctool)
 //
 // The function is idempotent and thread-safe.  It is called automatically
 // inside simVM.start() when RUN.vmci=true — callers do not need to build or
 // inject the shim explicitly.
 //
 // When gcc is unavailable the LD_PRELOAD shim is skipped (non-fatal); the
-// vmci-guest binary still allows vmware-rpctool-compatible RPC.
-// The vmci-guest build requires only the Go toolchain (always available).
-func buildVmciShim() (soPath, confPath, guestBinPath string, err error) {
+// toolbox binary handles both vmtoolsd and vmware-rpctool paths using AF_VSOCK
+// + DataMap framing (no backdoor required).
+// Both vmci-guest and toolbox builds require only the Go toolchain.
+func buildVmciShim() (soPath, confPath, guestBinPath, toolboxBinPath string, err error) {
 	vmciShimOnce.Do(func() {
 		dir, mkErr := os.MkdirTemp("", "vcsim-vmci-shim-*")
 		if mkErr != nil {
@@ -60,14 +63,8 @@ func buildVmciShim() (soPath, confPath, guestBinPath string, err error) {
 			return
 		}
 
-		// Build the vmci-guest static binary.  It is injected at two container
-		// paths:
-		//   /vmci-guest              — used by govmomi tests for get/set/roundtrip
-		//   /usr/bin/vmware-rpctool  — overrides the system wrapper; handles
-		//                              cloud-init's guestinfo queries without
-		//                              needing LD_PRELOAD (the system rpctool may
-		//                              be statically linked so LD_PRELOAD never
-		//                              applies).
+		// Build the vmci-guest static binary.  Injected at /vmci-guest for
+		// govmomi test subcommands (grpc-set, grpc-get, bidi, …).
 		guestBin := filepath.Join(dir, "vmci-guest")
 		goBuild := exec.Command(
 			"go", "build",
@@ -85,6 +82,30 @@ func buildVmciShim() (soPath, confPath, guestBinPath string, err error) {
 		}
 		vmciShimGuestBinPath = guestBin
 		log.Printf("vmci-backdoor-shim: built vmci-guest at %s", guestBin)
+
+		// Build the govmomi/toolbox binary.  Injected at /usr/bin/vmware-rpctool
+		// so cloud-init can read guestinfo without requiring LD_PRELOAD.  The
+		// toolbox binary uses AF_VSOCK + DataMap framing and does not execute
+		// the x86 IN backdoor instruction.
+		toolboxBin := filepath.Join(dir, "toolbox")
+		toolboxBuild := exec.Command(
+			"go", "build",
+			"-o", toolboxBin,
+			"github.com/vmware/govmomi/toolbox/toolbox",
+		)
+		toolboxBuild.Env = append(os.Environ(),
+			"CGO_ENABLED=0",
+			"GOOS=linux",
+			"GOARCH=amd64",
+		)
+		if out, buildErr := toolboxBuild.CombinedOutput(); buildErr != nil {
+			log.Printf("vmci-backdoor-shim: toolbox build failed (%v); vmware-rpctool auto-injection skipped\n%s", buildErr, out)
+			// Non-fatal: vmci-guest will not be injected as vmware-rpctool.
+			// Tests can inject the toolbox binary explicitly via RUN.volume.
+		} else {
+			vmciShimToolboxPath = toolboxBin
+			log.Printf("vmci-backdoor-shim: built toolbox at %s", toolboxBin)
+		}
 
 		// Compile the LD_PRELOAD C shim (best-effort: requires gcc).
 		// Used by dynamically-linked vmtoolsd; skipped silently if gcc is absent.
@@ -120,5 +141,24 @@ func buildVmciShim() (soPath, confPath, guestBinPath string, err error) {
 		}
 		vmciShimConfPath = cfgFile
 	})
-	return vmciShimSoPath, vmciShimConfPath, vmciShimGuestBinPath, vmciShimErr
+	return vmciShimSoPath, vmciShimConfPath, vmciShimGuestBinPath, vmciShimToolboxPath, vmciShimErr
+}
+
+// VmciToolboxBinaryPath returns the host path of the govmomi/toolbox static
+// binary built by buildVmciShim.  It is auto-injected as
+// /usr/bin/vmware-rpctool in every container-backed VM with RUN.vmci=true.
+//
+// Callers that also want to replace /usr/bin/vmtoolsd (e.g. supervisor-adm
+// integration tests that need the bootstrapper to write guestinfo via the
+// toolbox binary) can obtain the path here and add a RUN.volume.<label>
+// ExtraConfig entry:
+//
+//	"RUN.volume.vmtoolsd": simulator.VmciToolboxBinaryPath() + ":/usr/bin/vmtoolsd:ro"
+//
+// Returns "" if the build failed (RUN.vmci containers still work via the
+// auto-injected /usr/bin/vmware-rpctool, but /usr/bin/vmtoolsd callers will
+// fall back to whatever is in the container image).
+func VmciToolboxBinaryPath() string {
+	_, _, _, toolboxPath, _ := buildVmciShim()
+	return toolboxPath
 }

@@ -4,41 +4,43 @@
 
 //go:build linux
 
-// vmci-guest is the single static linux/amd64 test binary for all vcsim
-// VMCI/vsock interception tests.  It is injected into container-backed VMs via
-// RUN.volume at container start (same mechanism as vsock-test) and exec'd via
-// "docker exec" to exercise individual paths.  Each exec spawns a new process
-// tree, causing crun to open a new seccompFd connection to the vcsim listener
-// and exercising the Phase 6a multi-accept path.
+// vmci-guest is the vcsim VMCI/vsock test agent binary.
 //
-// Subcommands:
+// It is a static linux/amd64 binary injected into container-backed VMs via
+// RUN.volume at container start time.  Test code invokes it via "docker exec"
+// to exercise the multi-accept seccomp path and validate end-to-end VMCI/vsock
+// communication through the simulator.
+//
+// For the vmtoolsd/vmware-rpctool replacement binary used in production
+// simulation (i.e., for cloud-init and the supervisor bootstrapper), use the
+// govmomi/toolbox binary instead:
+//
+//	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+//	  -o /tmp/toolbox \
+//	  github.com/vmware/govmomi/toolbox/toolbox
+//
+// # Subcommands
 //
 //	grpc-set KEY VALUE
-//	    Connect via AF_VSOCK to port 976 (GuestRPC), send an info-set command,
-//	    and verify the ACK.  Exit 0 on success.
+//	    Set KEY to VALUE via AF_VSOCK GuestRPC (port 976, LE-frame protocol).
 //
 //	grpc-get KEY
-//	    Connect via AF_VSOCK to port 976 (GuestRPC), send an info-get command,
-//	    and print the bare value (no "1 " prefix) to stdout.  Exit 0 on success.
+//	    Print the value of KEY via AF_VSOCK GuestRPC (port 976, LE-frame).
 //
 //	grpc-roundtrip KEY VALUE
-//	    Connect via AF_VSOCK to port 976, set KEY=VALUE, then get KEY and verify
-//	    the round-trip.  Exits 0 on success.  Replaces vsock-test-intercept.
+//	    Set KEY=VALUE and get it back, verifying the round-trip.
 //
 //	rpc-cmd COMMAND
-//	    Send COMMAND (a single string, e.g. "info-get guestinfo.KEY") to the
-//	    GuestRPC server via AF_VSOCK port 976.  On success prints the bare value
-//	    (without the "1 " prefix) to stdout and exits 0; exits 1 on failure.
-//	    Also invoked implicitly when the binary is named "vmware-rpctool" so
-//	    it can act as a drop-in replacement for the system vmware-rpctool.
+//	    Send COMMAND (e.g. "info-get guestinfo.KEY") to the GuestRPC server
+//	    via AF_VSOCK and print the raw "1 VALUE" / "0 reason" response.
+//	    Exits 0 on channel success, 1 on channel failure.
 //
 //	bidi PORT WANT_FROM_HOST SEND_TO_HOST
-//	    Connect via AF_VSOCK to PORT.  Read a newline-terminated message from
-//	    the host and verify it equals WANT_FROM_HOST.  Send SEND_TO_HOST
-//	    (newline-terminated) to the host.  Exit 0 on success.
-//	    Exercises bidirectional data flow: host→guest and guest→host.
+//	    Connect to PORT via AF_VSOCK, read WANT_FROM_HOST from the host,
+//	    send SEND_TO_HOST.  Tests bidirectional communication through a
+//	    custom port handler.
 //
-// Build:
+// # Build
 //
 //	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
 //	  -o /tmp/vmci-guest \
@@ -111,7 +113,7 @@ func vsockDial(cid, port uint32) (*os.File, error) {
 	return os.NewFile(uintptr(fd), fmt.Sprintf("vsock-cid%d-port%d", cid, port)), nil
 }
 
-// writeFrame writes a 4-byte LE length-prefixed payload — the GuestRPC wire format.
+// writeFrame writes a 4-byte LE length-prefixed payload — the GuestRPC LE-frame wire format.
 func writeFrame(w io.Writer, payload string) error {
 	hdr := make([]byte, 4)
 	binary.LittleEndian.PutUint32(hdr, uint32(len(payload)))
@@ -142,8 +144,8 @@ func readFrame(r io.Reader) (string, error) {
 	return string(buf), nil
 }
 
-// guestRPCRoundTrip sends cmd via GuestRPC framing on the given file and
-// returns the raw response string (including the "1 " prefix on success).
+// guestRPCRoundTrip sends cmd via GuestRPC LE-frame framing on the given file
+// and returns the raw response string (including the "1 " prefix on success).
 func guestRPCRoundTrip(f *os.File, cmd string) (string, error) {
 	if err := writeFrame(f, cmd); err != nil {
 		return "", fmt.Errorf("writeFrame(%q): %w", cmd, err)
@@ -227,27 +229,14 @@ func cmdGRPCGet(key string) error {
 }
 
 // cmdRPCCmd sends a raw GuestRPC command string and prints the raw server
-// response, matching the real vmware-rpctool wire contract:
+// response, matching the vmware-rpctool wire contract:
 //
 //	Exit 0 + print "1 VALUE"          when the server responds "1 VALUE" (found)
 //	Exit 0 + print "0 No value found" when the server responds "0 ..." (missing key)
 //	Exit 1 (no output)                on channel failure (connect error, I/O error)
-//
-// This exit-code semantics is CRITICAL for cloud-init's DataSourceVMware:
-//   - Exit 0 → VMware environment detected (datasource selects DataSourceVMware)
-//   - Exit 1 → channel failure → datasource falls back to None
-//
-// The real vmware-rpctool binary prints the raw "1 …" / "0 …" response and
-// exits 0 for any successful channel round-trip (including "key not found").
-// cloud-init parses the "1 " prefix itself to distinguish found vs. missing.
-//
-// This allows the binary to replace the system vmware-rpctool (which may be
-// statically linked, bypassing LD_PRELOAD shims) while preserving full
-// cloud-init compatibility.
 func cmdRPCCmd(command string) error {
 	f, err := vsockDial(vmaddrCIDHost, rpciPort)
 	if err != nil {
-		// Channel failure: exit 1, no output — cloud-init will not identify VMware.
 		return err
 	}
 	defer f.Close()
@@ -256,8 +245,6 @@ func cmdRPCCmd(command string) error {
 	if err != nil {
 		return err
 	}
-	// Print the raw response including the "1 " or "0 " prefix.  Cloud-init
-	// parses this itself to distinguish found vs. missing keys.
 	fmt.Println(resp)
 	return nil // always exit 0 for successful channel round-trips
 }
@@ -276,7 +263,6 @@ func cmdBidi(port uint32, wantFromHost, sendToHost string) error {
 	}
 	defer f.Close()
 
-	// Host→Guest: read host's message (newline-terminated).
 	scanner := bufio.NewScanner(f)
 	if !scanner.Scan() {
 		if err := scanner.Err(); err != nil {
@@ -289,7 +275,6 @@ func cmdBidi(port uint32, wantFromHost, sendToHost string) error {
 		return fmt.Errorf("host message: got %q, want %q", got, wantFromHost)
 	}
 
-	// Guest→Host: send our message (newline-terminated).
 	if _, err := fmt.Fprintln(f, sendToHost); err != nil {
 		return fmt.Errorf("write to host: %w", err)
 	}
@@ -297,46 +282,34 @@ func cmdBidi(port uint32, wantFromHost, sendToHost string) error {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `vmci-guest — vcsim VMCI/vsock test agent
+	prog := filepath.Base(os.Args[0])
+	fmt.Fprintf(os.Stderr, `%s — vcsim VMCI/vsock test agent
 
 Subcommands:
   grpc-set KEY VALUE
-      Set KEY to VALUE via AF_VSOCK GuestRPC (port 976).
+      Set KEY to VALUE via AF_VSOCK GuestRPC (port 976, LE-frame).
 
   grpc-get KEY
-      Print the value of KEY via AF_VSOCK GuestRPC (port 976).
+      Print the value of KEY via AF_VSOCK GuestRPC (port 976, LE-frame).
 
   grpc-roundtrip KEY VALUE
       Set KEY=VALUE and get it back, verifying the round-trip.
 
   rpc-cmd COMMAND
       Send COMMAND (e.g. "info-get guestinfo.KEY") to the GuestRPC server.
-      Prints the value on success; exits 1 on failure.
+      Prints raw "1 VALUE" or "0 reason"; exits 1 on channel failure.
 
   bidi PORT WANT_FROM_HOST SEND_TO_HOST
       Connect to PORT, read WANT_FROM_HOST from host, send SEND_TO_HOST.
-      Tests bidirectional communication through a custom port handler.`)
+      Tests bidirectional communication through a custom port handler.
+
+For vmtoolsd / vmware-rpctool replacement, use the toolbox binary instead:
+  github.com/vmware/govmomi/toolbox/toolbox
+`, prog)
 	os.Exit(2)
 }
 
 func main() {
-	// vmware-rpctool compatibility mode: when the binary is installed under a
-	// name that contains "vmware-rpctool", treat the first argument as a raw
-	// GuestRPC command string (e.g. 'info-get guestinfo.metadata') and forward
-	// it to the GuestRPC server via AF_VSOCK.  This allows the binary to replace
-	// the system vmware-rpctool — which may be statically linked and therefore
-	// immune to LD_PRELOAD shims — without modifying the container image.
-	if strings.Contains(filepath.Base(os.Args[0]), "vmware-rpctool") {
-		if len(os.Args) != 2 {
-			fmt.Fprintln(os.Stderr, "usage: vmware-rpctool 'COMMAND'")
-			os.Exit(2)
-		}
-		if err := cmdRPCCmd(os.Args[1]); err != nil {
-			os.Exit(1)
-		}
-		return
-	}
-
 	if len(os.Args) < 2 {
 		usage()
 	}
