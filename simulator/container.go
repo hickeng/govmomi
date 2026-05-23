@@ -411,7 +411,7 @@ func createBridge(bridgeName string, labels ...string) (string, error) {
 //   - false → legacy string format: the image field holds the entire raw
 //     docker-run flag string (e.g. "-v '/path' nginx"), which must be passed
 //     verbatim to bash for word-splitting to work correctly.
-func create(ctx *Context, name string, id string, networks []string, volumes []string, ports []string, env []string, nestedContainers bool, seccompProfile string, image string, args []string, quoteImageAndArgs bool) (*container, error) {
+func create(ctx *Context, name string, id string, networks []string, volumes []string, ports []string, env []string, privileged bool, nestedContainers bool, seccompProfile string, image string, args []string, quoteImageAndArgs bool) (*container, error) {
 	if len(image) == 0 {
 		return nil, errors.New("cannot create container backing without an image")
 	}
@@ -452,6 +452,14 @@ func create(ctx *Context, name string, id string, networks []string, volumes []s
 	}
 
 	run := []string{"docker", "create", "--name", c.name}
+
+	if privileged && !nestedContainers {
+		// RUN.privileged=true: add --privileged without the full nestedContainers
+		// flag set. Used for systemd-init images that need privilege escalation but
+		// must NOT have --tmpfs /run (which would hide the RUN.vmci GuestRPC socket
+		// at /run/vmware/rpc.sock). cgroupns=host is kept (same as default mode).
+		run = append(run, "--privileged")
+	}
 
 	if nestedContainers {
 		// Add privileged mode for systemd compatibility

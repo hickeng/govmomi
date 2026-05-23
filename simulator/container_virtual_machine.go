@@ -21,6 +21,13 @@
 //   - RUN.network: Container network to use (e.g., "podman", "bridge").
 //     Important for rootless podman which needs explicit network for IP assignment.
 //
+//   - RUN.privileged: Boolean (default: false). Add --privileged to the container.
+//     Use this for images that run systemd as PID 1 but do NOT need the full
+//     kind-style nested-containers setup (which adds --tmpfs /run and conflicts
+//     with the RUN.vmci GuestRPC socket bind-mount at /run/vmware/rpc.sock).
+//     For full Kubernetes-in-container workloads, use RUN.nestedContainers=true
+//     instead.
+//
 //   - RUN.nestedContainers: Boolean (default: false). Enable nested container mode
 //     for running Kubernetes or other container workloads inside the container.
 //     When true, adds kind-style flags:
@@ -29,9 +36,14 @@
 //     --volume /var, --volume /lib/modules:/lib/modules:ro, --device /dev/fuse.
 //     Reference: https://github.com/kubernetes-sigs/kind/blob/main/pkg/cluster/internal/providers/docker/provision.go
 //
-//   - RUN.vmci: Boolean. Activate the full VMCI/vsock simulation layer:
-//     Component A (GuestRPC unix socket server) + Component B (seccomp AF_VSOCK
-//     interception).  Requires Linux 5.9+ and runc/podman with listenerPath support.
+//   - RUN.vmci: Boolean. Activate the VMCI simulation layer.
+//     Component A: GuestRPC unix socket server — injects the socket at
+//     /run/vmware/rpc.sock and sets VMX_RPC_SOCK so vmware-rpctool (toolbox
+//     binary) uses it. Clients must tolerate AF_VSOCK being unavailable and
+//     fall back to the VMX_RPC_SOCK unix socket path.
+//     Component B (AF_VSOCK seccomp interception) is currently disabled; see
+//     docs/specs/components/97-vcsim-vsock-guestrpc.md for the design and
+//     future-enhancement notes on port-differentiated VMCI simulation.
 //
 //   - RUN.port.<containerPort>: Map container port to host port.
 //     Example: RUN.port.80 = "8080" maps container port 80 to host port 8080.
@@ -107,7 +119,7 @@ type simVM struct {
 	vm       *VirtualMachine
 	c        *container
 	guestRPC *GuestRPCServer // non-nil when RUN.vmci=true; per-VM unix socket RPCI server
-	vsockVI  *vsockIntercept // non-nil when RUN.vmci=true; seccomp AF_VSOCK interceptor
+	vsockVI  *vsockIntercept // reserved; nil while AF_VSOCK interception is disabled
 }
 
 // createSimulationVM inspects the provided VirtualMachine and creates a simVM binding for it if
@@ -325,6 +337,7 @@ func (svm *simVM) start(ctx *Context) error {
 	var networks []string
 	var extraVolumes []string
 	mountDMI := true
+	privileged := false
 	nestedContainers := false
 
 	// jsonArgs is true when ContainerBackingOptionKey value was a valid JSON
@@ -354,6 +367,18 @@ func (svm *simVM) start(ctx *Context) error {
 				mountDMI = mount
 			}
 
+			continue
+		}
+
+		if val.Key == "RUN.privileged" {
+			// Add --privileged to the container without the full nestedContainers
+			// flag set. Use for systemd-init images that need privilege escalation
+			// but must NOT have --tmpfs /run (which would hide the RUN.vmci GuestRPC
+			// socket bind-mounted at /run/vmware/rpc.sock).
+			var priv bool
+			if err := json.Unmarshal([]byte(val.Value.(string)), &priv); err == nil {
+				privileged = priv
+			}
 			continue
 		}
 
@@ -443,20 +468,19 @@ func (svm *simVM) start(ctx *Context) error {
 	// so the socket exists when the container process first connects to it.
 	// Activated by RUN.vmci=true.
 	// Component A: GuestRPC server over unix socket (no kernel requirements).
-	// Component B: seccomp AF_VSOCK interception via listenerPath (kernel ≥5.9, runc ≥1.0).
-	// serve() loops on Accept() so both the initial container start and each
-	// subsequent podman exec get their own seccompFd event-loop goroutine.
-	seccompProfile := ""
+	// Component B (AF_VSOCK seccomp interception) is disabled; see RUN.vmci doc.
 	if vmciEnabled(svm.vm.Config.ExtraConfig) {
 		socketPath := GuestRPCSocketPath(svm.vm.uid.String())
+		socketDirPath := GuestRPCSocketDirPath(svm.vm.uid.String())
 		srv := newGuestRPCServer(svm.vm, socketPath)
 		if err := srv.Start(ctx); err != nil {
 			return fmt.Errorf("guestrpc server: %w", err)
 		}
 		svm.guestRPC = srv
 
-		// Advertise the socket path inside the container and mount it.
-		extraVolumes = append(extraVolumes, guestRPCVolumeMount(socketPath))
+		// Bind-mount the socket DIRECTORY (not the file) so the mount is visible
+		// even when RUN.nestedContainers=true adds --tmpfs /run. See guestRPCVolumeMount.
+		extraVolumes = append(extraVolumes, guestRPCVolumeMount(socketDirPath))
 		env = append(env, "VMX_RPC_SOCK="+GuestRPCSocketName)
 
 		// Build the vmci-guest test agent and the toolbox binary (once per process).
@@ -482,18 +506,6 @@ func (svm *simVM) start(ctx *Context) error {
 		}
 	}
 
-	// Component B: write the seccomp filter JSON before docker create so the
-	// --security-opt seccomp=<path> flag is available.  The listener socket is
-	// bound just before docker start (Phase 2, below) so crun can connect the
-	// moment the container process starts — no race with goroutine scheduling.
-	//
-	// When nestedContainers=true, create() strips the "--security-opt
-	// seccomp=unconfined" flag and appends the VMCI profile instead, preserving
-	// --cgroupns=private and --privileged.
-	if svm.guestRPC != nil {
-		seccompProfile = vsockWriteFilterFile(svm.vm.uid.String())
-	}
-
 	volumes := []string{}
 	if mountDMI {
 		volumes = append(volumes, constructVolumeName(svm.vm.Name, svm.vm.uid.String(), "dmi")+":/sys/class/dmi/id")
@@ -501,7 +513,7 @@ func (svm *simVM) start(ctx *Context) error {
 	volumes = append(volumes, extraVolumes...)
 
 	var err error
-	svm.c, err = create(ctx, svm.vm.Name, svm.vm.uid.String(), networks, volumes, ports, env, nestedContainers, seccompProfile, args[0], args[1:], jsonArgs)
+	svm.c, err = create(ctx, svm.vm.Name, svm.vm.uid.String(), networks, volumes, ports, env, privileged, nestedContainers, "" /* seccompProfile: Component B disabled */, args[0], args[1:], jsonArgs)
 	if err != nil {
 		return err
 	}
@@ -514,14 +526,6 @@ func (svm *simVM) start(ctx *Context) error {
 		if err != nil {
 			return err
 		}
-	}
-
-	// Phase 2: bind the listenerPath socket synchronously before docker start.
-	// The socket is in the kernel's listen state before this returns, so crun
-	// can connect the moment the container process starts — no scheduler race.
-	// Stored in svm.vsockVI so Stop() is called on VM power-off/destroy.
-	if seccompProfile != "" {
-		svm.vsockVI = newVsockInterceptAndStart(svm.vm.uid.String(), GuestRPCSocketPath(svm.vm.uid.String()), seccompProfile)
 	}
 
 	err = svm.c.start(ctx)
@@ -654,22 +658,12 @@ func (svm *simVM) remove(ctx *Context) error {
 		return nil
 	}
 
-	// Stop the container BEFORE stopping the vsock intercept.
-	//
-	// vsockIntercept.Stop() blocks on wg.Wait() until all event-loop goroutines
-	// exit.  Those goroutines are blocked in SECCOMP_IOCTL_NOTIF_RECV, which
-	// only unblocks when the supervised container process exits.  Stopping the
-	// container first ensures supervised processes exit before we call Stop().
-	//
-	// container.stop() runs "docker stop" (pure shell, no registry lock), so it
-	// is safe to call here even when Model.Remove() holds the registry's m lock.
+	// vsockVI is nil while Component B (AF_VSOCK interception) is disabled.
+	// The stop-before-intercept ordering is preserved for when it is re-enabled.
 	if svm.vsockVI != nil {
 		if err := svm.c.stop(ctx); err != nil {
 			log.Printf("%s remove: pre-vsock stop: %v", svm.vm.Name, err)
 		}
-	}
-
-	if svm.vsockVI != nil {
 		svm.vsockVI.Stop()
 	}
 	if svm.guestRPC != nil {

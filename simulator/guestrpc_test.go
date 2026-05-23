@@ -270,13 +270,20 @@ func TestGuestRPCServer_ConcurrentVMs(t *testing.T) {
 
 // TestGuestRPCServer_Cleanup verifies stale socket recovery.
 func TestGuestRPCServer_Cleanup(t *testing.T) {
-		env := newVCSIMEnv(t)
+	env := newVCSIMEnv(t)
 
 	vmObj := firstVM(env.simCtx)
 
 	socketPath := GuestRPCSocketPath(vmObj.Self.Value + "-cleanup")
-	t.Cleanup(func() { _ = os.Remove(socketPath) })
+	socketDir := GuestRPCSocketDirPath(vmObj.Self.Value + "-cleanup")
+	t.Cleanup(func() {
+		_ = os.Remove(socketPath)
+		_ = os.Remove(socketDir)
+	})
 
+	// Simulate a stale socket from a prior crash: pre-create the directory
+	// (normally created by Start) then write a non-socket placeholder file.
+	require.NoError(t, os.MkdirAll(socketDir, 0o700))
 	require.NoError(t, os.WriteFile(socketPath, []byte("stale"), 0600))
 
 	srv := newGuestRPCServer(vmObj, socketPath)

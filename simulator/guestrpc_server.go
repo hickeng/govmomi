@@ -25,6 +25,13 @@ const (
 	// GuestRPCSocketName is the well-known path inside every container-backed VM
 	// with RUN.vmci=true. The host-side unix socket is bind-mounted to this path.
 	GuestRPCSocketName = "/run/vmware/rpc.sock"
+
+	// GuestRPCSocketDir is the well-known DIRECTORY path inside every container-backed VM
+	// with RUN.vmci=true. vcsim bind-mounts this directory (not just the socket file) so
+	// the mount remains visible even when RUN.nestedContainers=true adds --tmpfs /run.
+	// A file bind-mount target under a tmpfs must already exist as a file; a directory
+	// bind-mount creates a new submount that overrides the tmpfs contents at that path.
+	GuestRPCSocketDir = "/run/vmware"
 )
 
 // GuestRPCServer is a per-VM host-side server that implements the toolbox RPCI
@@ -77,17 +84,34 @@ func newGuestRPCServer(vm *VirtualMachine, socketPath string) *GuestRPCServer {
 	}
 }
 
+// GuestRPCSocketDir returns the canonical per-VM host-side socket directory.
+// The directory is bind-mounted at GuestRPCSocketDir inside the container.
+// Using a directory mount (not a file mount) means the submount is visible even
+// when RUN.nestedContainers=true adds --tmpfs /run: the directory mount is applied
+// after the tmpfs in the OCI spec and creates a new submount at /run/vmware/,
+// whereas a file bind-mount requires the target file to already exist in the tmpfs.
+func GuestRPCSocketDirPath(vmUID string) string {
+	return filepath.Join(os.TempDir(), fmt.Sprintf("vcsim-rpc-%s", vmUID))
+}
+
 // GuestRPCSocketPath returns the canonical per-VM host-side unix socket path.
-// Keyed on the VM UUID so concurrent VMs never share a path.
+// The socket resides inside GuestRPCSocketDirPath so the directory bind-mount exposes it.
 func GuestRPCSocketPath(vmUID string) string {
-	return filepath.Join(os.TempDir(), fmt.Sprintf("vcsim-rpc-%s.sock", vmUID))
+	return filepath.Join(GuestRPCSocketDirPath(vmUID), "rpc.sock")
 }
 
 // Start begins listening on the unix socket and launches the accept loop.
 // ctx is the PowerOn/start Context; it is stored and used for AutoUpdate calls.
-// Removes any stale socket file from a prior crash before binding.
+// Creates the socket directory and removes any stale socket from a prior crash.
 func (s *GuestRPCServer) Start(ctx *Context) error {
 	s.ctx = ctx
+
+	// Create the socket directory.  The directory is bind-mounted into the
+	// container (not the socket file), so it must exist before docker create runs.
+	socketDir := filepath.Dir(s.socketPath)
+	if err := os.MkdirAll(socketDir, 0o700); err != nil {
+		return fmt.Errorf("GuestRPCServer %s: mkdir socket dir: %w", s.vm.Name, err)
+	}
 
 	// Remove stale socket from a prior crash.  If a live process still holds
 	// the socket, net.Listen will fail — surfacing the conflict rather than
@@ -118,6 +142,10 @@ func (s *GuestRPCServer) Stop() {
 	})
 	s.wg.Wait()
 	_ = os.Remove(s.socketPath)
+	// Best-effort cleanup of the socket directory created in Start.
+	// os.Remove fails silently if the directory is not empty (e.g. left-over
+	// files from a test crash), which is acceptable.
+	_ = os.Remove(filepath.Dir(s.socketPath))
 }
 
 func (s *GuestRPCServer) acceptLoop() {
@@ -342,9 +370,15 @@ func vmciEnabled(extraConfig []types.BaseOptionValue) bool {
 }
 
 // guestRPCVolumeMount returns the -v argument for bind-mounting the per-VM
-// GuestRPC socket into the container.
-func guestRPCVolumeMount(socketPath string) string {
-	return fmt.Sprintf("%s:%s", socketPath, GuestRPCSocketName)
+// GuestRPC socket directory into the container.
+//
+// We bind-mount the DIRECTORY (not the socket file) so the mount remains visible
+// when RUN.nestedContainers=true adds --tmpfs /run. A file bind-mount requires the
+// target to already exist as a file inside a fresh tmpfs (it doesn't); a directory
+// bind-mount creates a new submount at /run/vmware/ that overrides the empty tmpfs
+// content at that path, making rpc.sock accessible at its well-known container path.
+func guestRPCVolumeMount(socketDirPath string) string {
+	return fmt.Sprintf("%s:%s", socketDirPath, GuestRPCSocketDir)
 }
 
 // hasVolumeDest returns true if any RUN.volume.* ExtraConfig entry has dest as

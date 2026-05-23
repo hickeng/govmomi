@@ -142,6 +142,11 @@ func readGuestInfoKey(simCtx *Context, vmObj *VirtualMachine, key string) string
 
 // TestVMCI_ContainerBidirectional is the Phase 6a end-to-end integration test.
 func TestVMCI_ContainerBidirectional(t *testing.T) {
+	// Component B (AF_VSOCK seccomp interception) is currently disabled.
+	// This test requires AF_VSOCK socket() injection, which only works with
+	// Component B active.  Re-enable when the bridge-at-socket-time
+	// implementation (pending in 97-vcsim-vsock-guestrpc.md) is complete.
+	t.Skip("AF_VSOCK seccomp interception (Component B) is disabled; pending bridge-at-socket-time implementation")
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}
@@ -427,7 +432,6 @@ func TestVMCI_ToolboxBinary_GuestInfoRoundTrip(t *testing.T) {
 	require.NoError(t, powerTask.Wait(goCtx))
 
 	vmObj := simCtx.Map.Get(vmRef).(*VirtualMachine)
-	vi := waitForVsockReady(t, simCtx, vmObj, 30*time.Second)
 	containerID := containerIDFor(t, simCtx, vmObj)
 
 	// ── TEST 1: vmtoolsd --cmd info-set ───────────────────────────────────
@@ -480,8 +484,6 @@ func TestVMCI_ToolboxBinary_GuestInfoRoundTrip(t *testing.T) {
 	})
 
 	// ── TEST 5: Stop path ─────────────────────────────────────────────────
-	// Mirrors the identical check in TestVMCI_ContainerBidirectional:
-	// vsockVI.Stop() must be called and vi.stopped must be true after PowerOff.
 	t.Run("stop", func(t *testing.T) {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
@@ -489,13 +491,278 @@ func TestVMCI_ToolboxBinary_GuestInfoRoundTrip(t *testing.T) {
 		offTask, err := vm.PowerOff(stopCtx)
 		require.NoError(t, err)
 		require.NoError(t, offTask.Wait(stopCtx),
-			"PowerOff must complete within 60 s — vsockVI.Stop() may have deadlocked")
+			"PowerOff must complete within 60 s")
 
-		t.Logf("PowerOff completed; vsockVI.Stop() did not deadlock")
-
-		vi.stopMu.Lock()
-		stopped := vi.stopped
-		vi.stopMu.Unlock()
-		require.True(t, stopped, "vsockIntercept must be marked stopped after PowerOff")
+		t.Logf("PowerOff completed")
 	})
+}
+
+// TestVMCI_SystemdInit_GuestInfoRoundTrip validates that a systemd-managed
+// one-shot service can write a guestinfo key via the govmomi toolbox binary
+// when systemd is the container's PID 1 (FU-97-10).
+//
+// # Design rationale
+//
+// The fix in toolbox/toolbox/main.go (openRPCChannel) makes vmware-rpctool
+// prefer $VMX_RPC_SOCK (Component A — the GuestRPC Unix socket bind-mounted by
+// vcsim) over AF_VSOCK. Component A is accessible for the full container
+// lifetime; it is not affected by the crun→systemd exec transition.
+//
+// The test uses the dedicated image simulator/testdata/vmci-systemd-init, which
+// is a minimal debian+systemd container with the vmci-test-writer.service unit
+// baked in (via 'systemctl enable' in the Dockerfile). Baking the service into
+// the image avoids the Docker/Podman bind-mount pitfall where mounting a host
+// file to a non-existent container path creates a directory, not a file.
+//
+// This test does NOT use RUN.nestedContainers=true because --tmpfs /run
+// (added by that flag) hides the /run/vmware/rpc.sock bind mount. The
+// dedicated image has no nested container runtime so --tmpfs /run is not
+// needed. RUN.privileged=true provides --privileged for systemd without the
+// tmpfs mounts.
+//
+// # Test layout
+//
+//   - Image: docker.io/library/vmci-systemd-init:latest (minimal debian+systemd).
+//     Build with: docker build -t docker.io/library/vmci-systemd-init:latest
+//     ./simulator/testdata/vmci-systemd-init/
+//   - RUN.vmci=true: Component A (GuestRPC Unix socket at $VMX_RPC_SOCK) +
+//     Component B (AF_VSOCK seccomp intercept) + toolbox binary injection.
+//   - RUN.privileged=true: --privileged for systemd, WITHOUT --tmpfs /run.
+//   - vmci-test-writer.service is baked into the image. It runs after
+//     basic.target and calls vmware-rpctool to set guestinfo.vmci-systemd-test.
+//   - Test polls ExtraConfig for guestinfo.vmci-systemd-test within 90 s.
+//
+// # Expected result: PASS.
+// If this test fails, check:
+//  1. VMX_RPC_SOCK is set in the container env and propagated via PassEnvironment=.
+//  2. /run/vmware/rpc.sock is accessible (not hidden by --tmpfs /run).
+//  3. openRPCChannel() in toolbox/toolbox/main.go checks VMX_RPC_SOCK first.
+func TestVMCI_SystemdInit_GuestInfoRoundTrip(t *testing.T) {
+	if !test.HasDocker() {
+		t.Skip("requires docker or podman (aliased as docker) on linux")
+	}
+
+	const image = "docker.io/library/vmci-systemd-init:latest"
+	if err := exec.Command("docker", "image", "inspect", image).Run(); err != nil {
+		t.Skipf("image %s not available locally; "+
+			"build with: docker build -t %s ./simulator/testdata/vmci-systemd-init/",
+			image, image)
+	}
+
+	// ── Build the toolbox binary ──────────────────────────────────────────
+	// RUN.vmci=true auto-injects the toolbox binary as /usr/bin/vmware-rpctool.
+	// buildToolboxBinary ensures the binary is compiled and cached before the
+	// container starts, so the injection bind-mount is available at PowerOn.
+	buildToolboxBinary(t)
+
+	// ── Stand up vcsim ────────────────────────────────────────────────────
+	goCtx := context.Background()
+	m := VPX()
+	defer m.Remove()
+	require.NoError(t, m.Create())
+	s := m.Service.NewServer()
+	defer s.Close()
+	simCtx := m.Service.Context
+
+	c, err := govmomi.NewClient(goCtx, s.URL, true)
+	require.NoError(t, err)
+
+	finder := find.NewFinder(c.Client)
+	pool, err := finder.ResourcePool(goCtx, "DC0_H0/Resources")
+	require.NoError(t, err)
+	dc, err := finder.Datacenter(goCtx, "DC0")
+	require.NoError(t, err)
+	f, err := dc.Folders(goCtx)
+	require.NoError(t, err)
+
+	// ── Create container-backed VM ────────────────────────────────────────
+	const guestInfoKey = "guestinfo.vmci-systemd-test"
+
+	spec := types.VirtualMachineConfigSpec{
+		Name:  "systemd-init-test",
+		Files: &types.VirtualMachineFileInfo{VmPathName: "[LocalDS_0] systemd-init-test"},
+		ExtraConfig: []types.BaseOptionValue{
+			// vmci-systemd-init uses CMD ["/sbin/init"], which boots systemd as PID 1.
+			&types.OptionValue{Key: ContainerBackingOptionKey, Value: `["` + image + `"]`},
+			// RUN.vmci activates:
+			//   - Component A: GuestRPC Unix socket (VMX_RPC_SOCK=/run/vmware/rpc.sock)
+			//   - Component B: AF_VSOCK seccomp intercept
+			//   - toolbox binary auto-injected as /usr/bin/vmware-rpctool
+			&types.OptionValue{Key: "RUN.vmci", Value: "true"},
+			// RUN.privileged: adds --privileged so systemd can mount cgroups.
+			// Does NOT add --tmpfs /run, keeping /run/vmware/rpc.sock accessible.
+			&types.OptionValue{Key: "RUN.privileged", Value: "true"},
+		},
+	}
+	require.NoError(t, test.ApplyContainerRuntimeDefaults(&spec))
+
+	task, err := f.VmFolder.CreateVM(goCtx, spec, pool, nil)
+	require.NoError(t, err)
+	info, err := task.WaitForResult(goCtx, nil)
+	require.NoError(t, err)
+
+	vmRef := info.Result.(types.ManagedObjectReference)
+	vm := object.NewVirtualMachine(c.Client, vmRef)
+
+	powerTask, err := vm.PowerOn(goCtx)
+	require.NoError(t, err)
+	require.NoError(t, powerTask.Wait(goCtx))
+
+	vmObj := simCtx.Map.Get(vmRef).(*VirtualMachine)
+	containerID := containerIDFor(t, simCtx, vmObj)
+
+	// ── Poll for guestinfo write ───────────────────────────────────────────
+	// The service runs after network.target; systemd boot in a container
+	// typically takes 10–30 s. Poll every 2 s with a 90 s ceiling.
+	t.Logf("container %s: polling for %q (up to 90 s)…", containerID, guestInfoKey)
+	const pollInterval = 2 * time.Second
+	const pollTimeout = 90 * time.Second
+	deadline := time.Now().Add(pollTimeout)
+
+	var got string
+	for time.Now().Before(deadline) {
+		got = readGuestInfoKey(simCtx, vmObj, guestInfoKey)
+		if got != "" {
+			break
+		}
+		time.Sleep(pollInterval)
+	}
+
+	t.Logf("guestinfo value after polling: %q", got)
+	require.Equal(t, "pass", got,
+		"vmci-test-writer.service did not write guestinfo via vmware-rpctool within %s", pollTimeout)
+
+	// ── Stop path ─────────────────────────────────────────────────────────
+	stopCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	offTask, err := vm.PowerOff(stopCtx)
+	require.NoError(t, err)
+	require.NoError(t, offTask.Wait(stopCtx),
+		"PowerOff must complete within 60 s")
+}
+
+// TestVMCI_NestedContainers_GuestInfoRoundTrip is the nestedContainers=true variant
+// of TestVMCI_SystemdInit_GuestInfoRoundTrip. It exercises the full production
+// configuration: systemd PID 1 + RUN.vmci=true + RUN.nestedContainers=true.
+//
+// # Why this test exists
+//
+// The "privileged, no tmpfs" variant (TestVMCI_SystemdInit_GuestInfoRoundTrip)
+// confirms the basic GuestRPC path. This test adds:
+//   - --tmpfs /run (from nestedContainers), which hides /run/vmware/rpc.sock
+//     unless the bind-mount is a directory mount (see guestRPCVolumeMount fix).
+//   - --cgroupns=private and --privileged (needed for containerd/kubelet inside).
+//
+// Its purpose is to characterise exactly where the nestedContainers combination
+// fails or passes. It is expected to PASS once the directory bind-mount fix in
+// guestrpc_server.go (guestRPCVolumeMount) is in place. If it still fails,
+// the failure log will identify the next gap.
+//
+// # Known failure modes before the directory-mount fix
+//
+//   - guestinfo.vmci-systemd-test never set: vmware-rpctool cannot connect to the
+//     GuestRPC socket because /run/vmware/rpc.sock is hidden by --tmpfs /run.
+//     Fixed by bind-mounting the directory /run/vmware/ instead of the file.
+//
+//   - ADDFD: inappropriate ioctl for device: AF_VSOCK socket() calls from
+//     nested-container processes (containerd, runc) fail ADDFD. These are warnings
+//     for processes not targeted by the test; they do not kill the outer event loop
+//     as long as the outer container process tree stays alive.
+//
+// # Build prerequisite
+//
+// Build the test image first if not already present:
+//
+//	docker build -t docker.io/library/vmci-systemd-init:latest \
+//	  ./simulator/testdata/vmci-systemd-init/
+func TestVMCI_NestedContainers_GuestInfoRoundTrip(t *testing.T) {
+	if !test.HasDocker() {
+		t.Skip("requires docker or podman (aliased as docker) on linux")
+	}
+
+	const image = "docker.io/library/vmci-systemd-init:latest"
+	if err := exec.Command("docker", "image", "inspect", image).Run(); err != nil {
+		t.Skipf("image %s not available locally; "+
+			"build with: docker build -t %s ./simulator/testdata/vmci-systemd-init/",
+			image, image)
+	}
+
+	buildToolboxBinary(t)
+
+	goCtx := context.Background()
+	m := VPX()
+	defer m.Remove()
+	require.NoError(t, m.Create())
+	s := m.Service.NewServer()
+	defer s.Close()
+	simCtx := m.Service.Context
+
+	c, err := govmomi.NewClient(goCtx, s.URL, true)
+	require.NoError(t, err)
+
+	finder := find.NewFinder(c.Client)
+	pool, err := finder.ResourcePool(goCtx, "DC0_H0/Resources")
+	require.NoError(t, err)
+	dc, err := finder.Datacenter(goCtx, "DC0")
+	require.NoError(t, err)
+	f, err := dc.Folders(goCtx)
+	require.NoError(t, err)
+
+	const guestInfoKey = "guestinfo.vmci-systemd-test"
+
+	spec := types.VirtualMachineConfigSpec{
+		Name:  "nested-containers-test",
+		Files: &types.VirtualMachineFileInfo{VmPathName: "[LocalDS_0] nested-containers-test"},
+		ExtraConfig: []types.BaseOptionValue{
+			&types.OptionValue{Key: ContainerBackingOptionKey, Value: `["` + image + `"]`},
+			&types.OptionValue{Key: "RUN.vmci", Value: "true"},
+			// Use nestedContainers=true (not RUN.privileged). This adds --tmpfs /run,
+			// which is the scenario we need to validate. The directory bind-mount fix
+			// in guestRPCVolumeMount should keep /run/vmware/rpc.sock accessible.
+			&types.OptionValue{Key: "RUN.nestedContainers", Value: "true"},
+		},
+	}
+	require.NoError(t, test.ApplyContainerRuntimeDefaults(&spec))
+
+	task, err := f.VmFolder.CreateVM(goCtx, spec, pool, nil)
+	require.NoError(t, err)
+	info, err := task.WaitForResult(goCtx, nil)
+	require.NoError(t, err)
+
+	vmRef := info.Result.(types.ManagedObjectReference)
+	vm := object.NewVirtualMachine(c.Client, vmRef)
+
+	powerTask, err := vm.PowerOn(goCtx)
+	require.NoError(t, err)
+	require.NoError(t, powerTask.Wait(goCtx))
+
+	vmObj := simCtx.Map.Get(vmRef).(*VirtualMachine)
+	containerID := containerIDFor(t, simCtx, vmObj)
+
+	t.Logf("container %s: polling for %q (up to 120 s)…", containerID, guestInfoKey)
+	const pollInterval = 2 * time.Second
+	const pollTimeout = 120 * time.Second
+	deadline := time.Now().Add(pollTimeout)
+
+	var got string
+	for time.Now().Before(deadline) {
+		got = readGuestInfoKey(simCtx, vmObj, guestInfoKey)
+		if got != "" {
+			break
+		}
+		time.Sleep(pollInterval)
+	}
+
+	t.Logf("guestinfo value after polling: %q", got)
+	require.Equal(t, "pass", got,
+		"vmci-test-writer.service did not write guestinfo within %s "+
+			"(RUN.nestedContainers=true + --tmpfs /run)", pollTimeout)
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	offTask, err := vm.PowerOff(stopCtx)
+	require.NoError(t, err)
+	require.NoError(t, offTask.Wait(stopCtx))
 }

@@ -12,13 +12,24 @@
 //
 // All modes (daemon, one-shot, rpctool) share the same selection logic:
 //
-//	1. AF_VSOCK with DataMap framing is tried first.  Works on:
-//	   • Real ESX VMs with the vmci kernel module loaded.
-//	   • govmomi/simulator container-backed VMs (RUN.vmci=true via seccomp
-//	     intercept that replaces the vsock FD with a Unix socketpair).
-//	2. x86 backdoor channel (in eax,dx / port 0x5658) is used as fallback
-//	   when AF_VSOCK is unavailable (VMware Workstation/Fusion, or ESX VMs
-//	   without the vmci kernel module).
+//  1. VMX_RPC_SOCK Unix socket — preferred when $VMX_RPC_SOCK is set.
+//     govmomi/simulator sets this env var on container-backed VMs (RUN.vmci=true)
+//     and bind-mounts the socket into the container. The Unix socket persists for
+//     the full container lifetime, unlike the AF_VSOCK seccomp intercept which is
+//     tied to the initial crun process and cannot be re-established after systemd
+//     (or a nested container runtime) exec-replaces that process. Use this transport
+//     for any service that runs AFTER initial container boot (e.g. systemd services).
+//
+//  2. AF_VSOCK with DataMap framing.  Works on:
+//     • Real ESX VMs with the vmci kernel module loaded.
+//     • govmomi/simulator container-backed VMs (RUN.vmci=true via seccomp
+//       intercept that replaces the vsock FD with a Unix socketpair) — reliable
+//       only during the crun-managed phase of container startup, before exec into
+//       systemd or nested-container runtimes invalidate the seccomp notification FD.
+//
+//  3. x86 backdoor channel (in eax,dx / port 0x5658) — fallback when neither
+//     VMX_RPC_SOCK nor AF_VSOCK is available (VMware Workstation/Fusion, or ESX
+//     VMs without the vmci kernel module).
 //
 // Errors from channel open are always reported to stderr; the binary never
 // fails silently.
@@ -113,8 +124,11 @@ func main() {
 	service.Wait()
 }
 
-// selectChannels returns (in, out) channels for daemon mode using the same
-// preference order as openRPCChannel: AF_VSOCK first, backdoor as fallback.
+// selectChannels returns (in, out) channels for daemon mode.
+// VMX_RPC_SOCK is NOT used here: the Unix socket server closes after each
+// request, so a persistent daemon channel would break on the second exchange.
+// Daemon mode relies on AF_VSOCK (which the seccomp intercept keeps alive
+// during initial crun setup) or the x86 backdoor.
 func selectChannels() (toolbox.Channel, toolbox.Channel) {
 	if toolbox.IsVsockAvailable() {
 		return toolbox.NewNoopChannelIn(), toolbox.NewVsockChannelOut()
@@ -122,17 +136,40 @@ func selectChannels() (toolbox.Channel, toolbox.Channel) {
 	return toolbox.NewBackdoorChannelIn(), toolbox.NewBackdoorChannelOut()
 }
 
+// wellKnownGuestRPCSock is the path at which govmomi/simulator bind-mounts the
+// per-VM GuestRPC unix socket when RUN.vmci=true.  It is tried as a fallback
+// when VMX_RPC_SOCK is not set — which happens when the toolbox binary is
+// invoked from a systemd service unit that does not inherit the container's
+// initial environment (systemd does not automatically propagate environment
+// variables from PID 1's environment to child service units).
+const wellKnownGuestRPCSock = "/run/vmware/rpc.sock"
+
 // openRPCChannel returns the best available GuestRPC outbound channel.
 //
 // Selection order:
-//  1. AF_VSOCK (DataMap framing) — works on real ESX VMs with the vmci kernel
-//     module and on govmomi/simulator container-backed VMs (RUN.vmci=true).
-//  2. x86 backdoor — works on VMware Workstation/Fusion and ESX VMs without
-//     the vmci module.
+//  1. VMX_RPC_SOCK unix socket — set by govmomi/simulator on container-backed VMs.
+//     The socket is accessible for the full container lifetime and is not affected
+//     by the crun→systemd exec transition that invalidates the AF_VSOCK seccomp fd.
+//  2. Well-known unix socket path (/run/vmware/rpc.sock) — same socket as (1)
+//     but accessed by path when VMX_RPC_SOCK is not present in the process
+//     environment (e.g. systemd service units invoked from the bootstrapper).
+//  3. AF_VSOCK (DataMap framing) — real ESX VMs or RUN.vmci=true during crun phase.
+//  4. x86 backdoor — VMware Workstation/Fusion fallback.
 //
-// Returns a non-nil error (with a descriptive message) if neither transport
-// can be opened; the binary never fails silently.
+// Returns a non-nil error only if all four transports are unavailable.
 func openRPCChannel() (toolbox.Channel, error) {
+	// Unix socket: try VMX_RPC_SOCK env var first, then the well-known path.
+	// If both resolve to the same path (or if VMX_RPC_SOCK is unset), the
+	// extra attempt is two fast dial failures — acceptable cost for simplicity.
+	for _, sockPath := range []string{os.Getenv("VMX_RPC_SOCK"), wellKnownGuestRPCSock} {
+		if sockPath == "" {
+			continue
+		}
+		ch := toolbox.NewUnixChannelOut(sockPath)
+		if err := ch.Start(); err == nil {
+			return ch, nil
+		}
+	}
 	if toolbox.IsVsockAvailable() {
 		ch := toolbox.NewVsockChannelOut()
 		if err := ch.Start(); err == nil {
@@ -141,7 +178,8 @@ func openRPCChannel() (toolbox.Channel, error) {
 	}
 	ch := toolbox.NewBackdoorChannelOut()
 	if err := ch.Start(); err != nil {
-		return nil, fmt.Errorf("GuestRPC channel unavailable: AF_VSOCK not present and backdoor failed: %w", err)
+		return nil, fmt.Errorf("GuestRPC channel unavailable: unix socket not found at %s or %s, AF_VSOCK not present, and backdoor failed: %w",
+			os.Getenv("VMX_RPC_SOCK"), wellKnownGuestRPCSock, err)
 	}
 	return ch, nil
 }

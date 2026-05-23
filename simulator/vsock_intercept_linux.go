@@ -537,10 +537,37 @@ func (vi *vsockIntercept) eventLoop(seccompFd int) error {
 				vi.vmUID, count, notif.PID, notif.Data.Args[:3])
 			go vi.handleSocket(seccompFd, &notif)
 		case int32(syscall.SYS_BIND):
+			// Fast path: skip goroutine for the common non-vsock case.
+			// bind() is intercepted without argument filtering; nearly every
+			// process in the container (kubelet, etcd, kube-apiserver) calls
+			// bind() for TCP/UDP.  Only vsock FDs (previously injected via
+			// handleSocket) are in vi.tracked; all others get CONTINUE
+			// immediately in the event loop without spawning a goroutine.
+			fd := notif.Data.Args[0]
+			tgid := tidToTGID(notif.PID)
+			vi.mu.Lock()
+			_, vsockBind := vi.tracked[pidFDKey{pid: tgid, fd: fd}]
+			vi.mu.Unlock()
+			if !vsockBind {
+				vi.respond(seccompFd, notif.ID, 0, 0, seccompUserNotifFlagContinue)
+				continue
+			}
 			go vi.handleBind(seccompFd, &notif)
 		case int32(syscall.SYS_CONNECT):
-			log.Printf("vsockIntercept %s: RECV connect #%d pid=%d fd=%d",
-				vi.vmUID, count, notif.PID, notif.Data.Args[0])
+			// Fast path: same rationale as SYS_BIND above — avoid goroutine
+			// spawn and logging for the vast majority of non-vsock connect()
+			// calls that Kubernetes components make.
+			fd := notif.Data.Args[0]
+			tgid := tidToTGID(notif.PID)
+			vi.mu.Lock()
+			_, vsockConnect := vi.tracked[pidFDKey{pid: tgid, fd: fd}]
+			vi.mu.Unlock()
+			if !vsockConnect {
+				vi.respond(seccompFd, notif.ID, 0, 0, seccompUserNotifFlagContinue)
+				continue
+			}
+			log.Printf("vsockIntercept %s: RECV connect tracked #%d pid=%d fd=%d",
+				vi.vmUID, count, notif.PID, fd)
 			go vi.handleConnect(seccompFd, &notif)
 		default:
 			log.Printf("vsockIntercept %s: RECV unknown nr=%d #%d pid=%d",
