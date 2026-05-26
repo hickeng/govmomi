@@ -420,6 +420,19 @@ func create(ctx *Context, name string, id string, networks []string, volumes []s
 	c.name = constructContainerName(name, id)
 	c.changes = make(chan struct{})
 
+	// Proactively remove any container already using this name before creating.
+	// Container names encode the VM UUID, which is deterministic (derived from
+	// VmPathName via internal.OID) and stable across test runs.  When the Go
+	// test harness fires os.Exit(2) for -timeout, defers do not execute, leaving
+	// containers orphaned in Created, Running, or Stopped state.  Force-removing
+	// by name before create guarantees a clean slate and avoids the "already in
+	// use" create failure that would otherwise surface as a confusing error.
+	if _, preRmErr := exec.Command("docker", "rm", "-f", c.name).Output(); preRmErr == nil {
+		log.Printf("container create: removed stale container %q before create", c.name)
+	}
+	// preRmErr is deliberately ignored: a non-zero exit means no container with
+	// that name existed, which is the expected case on every clean run.
+
 	for i := range volumes {
 		// Pre-create named Docker volumes for labelling consistency.
 		// Skip bind mounts (host paths starting with "/") — those already exist.
@@ -531,10 +544,11 @@ func create(ctx *Context, name string, id string, networks []string, volumes []s
 	cmd := exec.Command(shell, "-c", createArgs)
 	out, err := cmd.Output()
 	if err != nil {
-		// When the container name is already in use (e.g. from a previous test run
-		// that was killed before cleanup), force-remove it by name and retry once.
+		// Belt-and-suspenders: the proactive pre-create rm above handles the
+		// common case, but a race between two concurrent creates with the same
+		// name can still produce "already in use".  Retry once if that happens.
 		if eErr, ok := err.(*exec.ExitError); ok && strings.Contains(string(eErr.Stderr), "already in use") {
-			log.Printf("container create: name %q already in use, removing stale container and retrying", c.name)
+			log.Printf("container create: name %q already in use after pre-create cleanup, removing and retrying", c.name)
 			rmCmd := exec.Command("docker", "rm", "-f", c.name)
 			_ = rmCmd.Run()
 			cmd = exec.Command(shell, "-c", createArgs)
