@@ -17,10 +17,9 @@ import (
 )
 
 var (
-	vmciArtifactsOnce         sync.Once
-	vmciArtifactsGuestPath string
-	vmciArtifactsToolboxPath  string
-	vmciArtifactsErr          error
+	vmciArtifactsOnce        sync.Once
+	vmciArtifactsToolboxPath string
+	vmciArtifactsErr         error
 )
 
 // artifactsBinDir returns the stable host directory used to cache vmci
@@ -50,14 +49,19 @@ func artifactsBinDir() (string, error) {
 	return dir, nil
 }
 
-// buildVmciArtifacts returns the paths to the VMCI simulation binaries,
-// building them only if they are not already present in the cache directory:
-//   - guestBinPath:   vmci-guest  (test agent; injected at /vmci-guest)
-//   - toolboxBinPath: toolbox     (govmomi/toolbox; injected as /usr/bin/vmware-rpctool)
+// buildToolboxArtifact returns the path to the govmomi/toolbox binary
+// (injected as /usr/bin/vmware-rpctool in container-backed VMs with
+// RUN.vmci=true), building it only if it is not already present in the
+// cache directory.
 //
 // The function is idempotent and thread-safe (sync.Once per process).  It is
 // called automatically inside simVM.start() when RUN.vmci=true.
-func buildVmciArtifacts() (guestBinPath, toolboxBinPath string, err error) {
+//
+// A build failure here is non-fatal to the caller: it is logged and the
+// returned path is empty, so /usr/bin/vmware-rpctool auto-injection is
+// skipped, but the container still starts. Callers that need to guarantee
+// the binary is present should check VmciToolboxBinaryPath() for emptiness.
+func buildToolboxArtifact() (toolboxBinPath string, err error) {
 	vmciArtifactsOnce.Do(func() {
 		dir, mkErr := artifactsBinDir()
 		if mkErr != nil {
@@ -65,33 +69,6 @@ func buildVmciArtifacts() (guestBinPath, toolboxBinPath string, err error) {
 			return
 		}
 
-		// vmci-guest: test agent binary injected at /vmci-guest.
-		// Build failure is fatal — the test agent is always required.
-		guestBin := filepath.Join(dir, "vmci-guest")
-		if _, statErr := os.Stat(guestBin); os.IsNotExist(statErr) {
-			goBuild := exec.Command(
-				"go", "build",
-				"-o", guestBin,
-				"github.com/vmware/govmomi/simulator/testdata/vmci-guest",
-			)
-			goBuild.Env = append(os.Environ(),
-				"CGO_ENABLED=0",
-				"GOOS=linux",
-				"GOARCH=amd64",
-			)
-			if out, buildErr := goBuild.CombinedOutput(); buildErr != nil {
-				vmciArtifactsErr = fmt.Errorf("vmci-guest build: %w\n%s", buildErr, out)
-				return
-			}
-			log.Printf("vmci-artifacts: built vmci-guest at %s", guestBin)
-		} else {
-			log.Printf("vmci-artifacts: vmci-guest cached at %s", guestBin)
-		}
-		vmciArtifactsGuestPath = guestBin
-
-		// toolbox: govmomi/toolbox binary injected at /usr/bin/vmware-rpctool.
-		// Build failure is non-fatal — auto-injection is skipped but tests may
-		// still inject the binary explicitly via RUN.volume.
 		toolboxBin := filepath.Join(dir, "toolbox")
 		if _, statErr := os.Stat(toolboxBin); os.IsNotExist(statErr) {
 			toolboxBuild := exec.Command(
@@ -105,7 +82,7 @@ func buildVmciArtifacts() (guestBinPath, toolboxBinPath string, err error) {
 				"GOARCH=amd64",
 			)
 			if out, buildErr := toolboxBuild.CombinedOutput(); buildErr != nil {
-				log.Printf("vmci-artifacts: toolbox build failed (%v); vmware-rpctool auto-injection skipped\n%s", buildErr, out)
+				vmciArtifactsErr = fmt.Errorf("toolbox build: %w\n%s", buildErr, out)
 				return
 			}
 			log.Printf("vmci-artifacts: built toolbox at %s", toolboxBin)
@@ -114,11 +91,11 @@ func buildVmciArtifacts() (guestBinPath, toolboxBinPath string, err error) {
 		}
 		vmciArtifactsToolboxPath = toolboxBin
 	})
-	return vmciArtifactsGuestPath, vmciArtifactsToolboxPath, vmciArtifactsErr
+	return vmciArtifactsToolboxPath, vmciArtifactsErr
 }
 
 // VmciToolboxBinaryPath returns the host path of the govmomi/toolbox static
-// binary built by buildVmciArtifacts.  It is auto-injected as
+// binary built by buildToolboxArtifact.  It is auto-injected as
 // /usr/bin/vmware-rpctool in every container-backed VM with RUN.vmci=true.
 //
 // Callers that also want to replace /usr/bin/vmtoolsd (e.g. supervisor-adm
@@ -132,6 +109,6 @@ func buildVmciArtifacts() (guestBinPath, toolboxBinPath string, err error) {
 // auto-injected /usr/bin/vmware-rpctool, but /usr/bin/vmtoolsd callers will
 // fall back to whatever is in the container image).
 func VmciToolboxBinaryPath() string {
-	_, toolboxPath, _ := buildVmciArtifacts()
-	return toolboxPath
+	path, _ := buildToolboxArtifact()
+	return path
 }

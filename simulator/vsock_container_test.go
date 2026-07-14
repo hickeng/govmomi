@@ -6,35 +6,19 @@
 
 package simulator
 
-// TestVMCI_ContainerBidirectional exercises the full VMCI/vsock interception
-// stack using a real container + the vmci-guest test agent binary.
+// Container-backed integration tests for the govmomi/toolbox binary acting as
+// vmtoolsd/vmware-rpctool, exercising GuestRPC over the Component-A Unix
+// socket (the seccomp-based AF_VSOCK intercept, "Component B", has been
+// removed from this branch; see vcsim-sv2-enablement-vsock-component-b for
+// that work, tracked for future re-enablement per 97-vcsim-vsock-guestrpc.md
+// FU-97-12).
 //
-// The vmci-guest binary is built once and injected via RUN.volume at container
-// start (same mechanism as TestContainerGuestRPC_*).  Individual test scenarios
-// are driven via "docker exec", each of which spawns a new process tree in the
-// container and causes crun to open a fresh seccompFd connection to the vcsim
-// listener — exercising the Phase 6a multi-accept loop.
-//
-// This test is the primary end-to-end validation of:
-//
-//   - AF_VSOCK socket() interception (socketpair injection).
-//   - connect() dispatch to registered VMCIPortHandlers.
-//   - VM→Host GuestRPC (info-set / info-get via port 976).
-//   - Host→VM data flow within a custom handler (port 7777).
-//   - Guest→Host data flow within the same custom connection.
-//   - Bidirectional exchange via a port handler registered after PowerOn.
-//   - vsockVI.Stop() shutdown path after container exit.
-//
-// Requires: Docker (or podman aliased as docker) on Linux, alpine image.
+// Requires: Docker (or podman aliased as docker) on Linux.
 // Skip gate: test.HasDocker().
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
-	"net"
-	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -53,14 +37,14 @@ import (
 // binary.  It is the canonical vmtoolsd / vmware-rpctool replacement for
 // container-backed VMs in vcsim tests.
 // buildToolboxBinary returns the path to the cached govmomi/toolbox binary,
-// sharing the build with the simulator's own buildVmciArtifacts (sync.Once).
+// sharing the build with the simulator's own buildToolboxArtifact (sync.Once).
 // This avoids a second independent "go build" when RUN.vmci=true is set,
-// which would also trigger buildVmciArtifacts during PowerOn.
+// which would also trigger buildToolboxArtifact during PowerOn.
 func buildToolboxBinary(t *testing.T) string {
 	t.Helper()
-	_, path, err := buildVmciArtifacts()
+	path, err := buildToolboxArtifact()
 	if err != nil {
-		t.Skipf("vmci artifact build failed: %v", err)
+		t.Skipf("toolbox artifact build failed: %v", err)
 	}
 	if path == "" {
 		t.Skip("toolbox binary unavailable (govmomi/toolbox build may have been skipped)")
@@ -84,31 +68,6 @@ func dockerExec(t *testing.T, ctx context.Context, containerID string, args ...s
 		t.Fatalf("docker exec %v: %v\nstderr: %s", args, err, stderr)
 	}
 	return strings.TrimSpace(string(out))
-}
-
-// waitForVsockReady returns the vsockIntercept for vmObj, blocking until it is
-// non-nil and has signalled readiness (first seccompFd received from crun).
-// Fails the test if either condition is not met within deadline.
-func waitForVsockReady(t *testing.T, simCtx *Context, vmObj *VirtualMachine, deadline time.Duration) *vsockIntercept {
-	t.Helper()
-
-	var vi *vsockIntercept
-	simCtx.WithLock(vmObj, func() {
-		if vmObj.svm != nil {
-			vi = vmObj.svm.vsockVI
-		}
-	})
-	if vi == nil {
-		t.Fatal("waitForVsockReady: vsockVI is nil — RUN.vmci not applied?")
-	}
-
-	select {
-	case <-vi.ready:
-		t.Logf("vsock intercept ready (seccompFd received)")
-	case <-time.After(deadline):
-		t.Fatalf("vsock intercept not ready after %s — crun never connected?", deadline)
-	}
-	return vi
 }
 
 // containerIDFor returns the Docker container ID for vmObj's running container.
@@ -140,229 +99,24 @@ func readGuestInfoKey(simCtx *Context, vmObj *VirtualMachine, key string) string
 	return val
 }
 
-// TestVMCI_ContainerBidirectional is the Phase 6a end-to-end integration test.
-func TestVMCI_ContainerBidirectional(t *testing.T) {
-	// Component B (AF_VSOCK seccomp interception) is currently disabled.
-	// This test requires AF_VSOCK socket() injection, which only works with
-	// Component B active.  Re-enable when the bridge-at-socket-time
-	// implementation (pending in 97-vcsim-vsock-guestrpc.md) is complete.
-	t.Skip("AF_VSOCK seccomp interception (Component B) is disabled; pending bridge-at-socket-time implementation")
-	if !test.HasDocker() {
-		t.Skip("requires docker or podman (aliased as docker) on linux")
-	}
-
-	// ── Build the guest binary ────────────────────────────────────────────
-	// The binary is volume-mounted at container start so it is available
-	// immediately without a separate docker cp step.
-	guestBin := buildStaticBinary(t,
-		"github.com/vmware/govmomi/simulator/testdata/vmci-guest",
-		"vmci-guest")
-
-	// ── Stand up vcsim ────────────────────────────────────────────────────
-	goCtx := context.Background()
-	m := VPX()
-	defer m.Remove()
-	require.NoError(t, m.Create())
-	s := m.Service.NewServer()
-	defer s.Close()
-	simCtx := m.Service.Context
-
-	c, err := govmomi.NewClient(goCtx, s.URL, true)
-	require.NoError(t, err)
-
-	finder := find.NewFinder(c.Client)
-	pool, err := finder.ResourcePool(goCtx, "DC0_H0/Resources")
-	require.NoError(t, err)
-	dc, err := finder.Datacenter(goCtx, "DC0")
-	require.NoError(t, err)
-	f, err := dc.Folders(goCtx)
-	require.NoError(t, err)
-
-	// ── Create container-backed VM ────────────────────────────────────────
-	// The container main command uses a SIGTERM trap so "docker stop" completes
-	// in < 1 s.  BusyBox sleep ignores SIGTERM; the sh trap catches it.
-	// RUN.vmci enables both the GuestRPC server (port 976) and the AF_VSOCK
-	// seccomp intercept.  RUN.volume injects vmci-guest at container start so
-	// every docker exec has the binary available without a docker cp step.
-	spec := types.VirtualMachineConfigSpec{
-		Name: "vmci-bidi-test",
-		Files: &types.VirtualMachineFileInfo{
-			VmPathName: "[LocalDS_0] vmci-bidi-test",
-		},
-		ExtraConfig: []types.BaseOptionValue{
-			&types.OptionValue{
-				Key:   ContainerBackingOptionKey,
-				Value: `["alpine","sh","-c","trap exit SIGTERM; sleep infinity & wait"]`,
-			},
-			&types.OptionValue{Key: "RUN.vmci", Value: "true"},
-			&types.OptionValue{Key: "RUN.volume.vmci-guest", Value: guestBin + ":/vmci-guest:ro"},
-		},
-	}
-	require.NoError(t, test.ApplyContainerRuntimeDefaults(&spec))
-
-	task, err := f.VmFolder.CreateVM(goCtx, spec, pool, nil)
-	require.NoError(t, err)
-	info, err := task.WaitForResult(goCtx, nil)
-	require.NoError(t, err)
-
-	vmRef := info.Result.(types.ManagedObjectReference)
-	vm := object.NewVirtualMachine(c.Client, vmRef)
-
-	// ── PowerOn — starts the container with vmci-guest already mounted ────
-	powerTask, err := vm.PowerOn(goCtx)
-	require.NoError(t, err)
-	require.NoError(t, powerTask.Wait(goCtx))
-
-	vmObj := simCtx.Map.Get(vmRef).(*VirtualMachine)
-
-	// ── Wait for seccomp intercept to be active ───────────────────────────
-	vi := waitForVsockReady(t, simCtx, vmObj, 30*time.Second)
-
-	containerID := containerIDFor(t, simCtx, vmObj)
-
-	// ── Register bidirectional handler on port 7777 ───────────────────────
-	// Must happen before "docker exec bidi" so the handler is present when the
-	// guest binary issues connect(AF_VSOCK, CID=2, port=7777).
-	const bidiPort = uint32(7777)
-	const hostMsg = "H2G:ping"
-	const guestMsg = "G2H:pong"
-
-	bidiResult := make(chan error, 1)
-	vi.reg.register(bidiPort, func(_ string, hostFd int, _, _ uint32) {
-		defer func() {
-			if r := recover(); r != nil {
-				select {
-				case bidiResult <- fmt.Errorf("handler panic: %v", r):
-				default:
-				}
-			}
-		}()
-
-		hostFile := os.NewFile(uintptr(hostFd), "vmci-bidi-host")
-		conn, err := net.FileConn(hostFile)
-		hostFile.Close()
-		if err != nil {
-			select {
-			case bidiResult <- fmt.Errorf("FileConn: %w", err):
-			default:
-			}
-			return
-		}
-		defer conn.Close()
-
-		if _, err := fmt.Fprintln(conn, hostMsg); err != nil {
-			select {
-			case bidiResult <- fmt.Errorf("write H2G: %w", err):
-			default:
-			}
-			return
-		}
-
-		sc := bufio.NewScanner(conn)
-		if !sc.Scan() {
-			scanErr := sc.Err()
-			if scanErr == nil {
-				scanErr = io.EOF
-			}
-			select {
-			case bidiResult <- fmt.Errorf("scan G2H: %w", scanErr):
-			default:
-			}
-			return
-		}
-		got := sc.Text()
-		if got != guestMsg {
-			select {
-			case bidiResult <- fmt.Errorf("G2H: got %q, want %q", got, guestMsg):
-			default:
-			}
-			return
-		}
-		select {
-		case bidiResult <- nil:
-		default:
-		}
-	})
-
-	// ── TEST 1: VM→Host GuestRPC info-set via AF_VSOCK ────────────────────
-	t.Run("grpc-set", func(t *testing.T) {
-		const key = "guestinfo.vmci.container.test"
-		const val = "agent-ok"
-
-		dockerExec(t, goCtx, containerID, "/vmci-guest", "grpc-set", key, val)
-
-		got := readGuestInfoKey(simCtx, vmObj, key)
-		require.Equal(t, val, got,
-			"guestinfo key %q must be set after grpc-set exec", key)
-	})
-
-	// ── TEST 2: Bidirectional exchange via custom port handler ────────────
-	t.Run("bidi", func(t *testing.T) {
-		dockerExec(t, goCtx, containerID,
-			"/vmci-guest", "bidi",
-			fmt.Sprint(bidiPort), hostMsg, guestMsg)
-
-		select {
-		case handlerErr := <-bidiResult:
-			require.NoError(t, handlerErr, "bidi port handler must succeed")
-		case <-time.After(10 * time.Second):
-			t.Fatal("bidi handler did not complete within 10 s")
-		}
-	})
-
-	// ── TEST 3: VM→Host GuestRPC info-get via AF_VSOCK ───────────────────
-	// Each docker exec → new crun conn → new seccompFd scope → new socket/connect cycle.
-	t.Run("grpc-get", func(t *testing.T) {
-		const key = "guestinfo.vmci.container.test"
-		const want = "agent-ok"
-
-		got := dockerExec(t, goCtx, containerID, "/vmci-guest", "grpc-get", key)
-		require.Equal(t, want, got,
-			"grpc-get output must match the value set by grpc-set")
-	})
-
-	// ── TEST 4: Stop path ─────────────────────────────────────────────────
-	// PowerOff → svm.c.stop() (docker stop) → svm.vsockVI.Stop().
-	// c.stop() is called before vsockVI.Stop() so container processes exit
-	// first; the SIGTERM trap ensures docker stop completes in < 1 s.
-	// vsockVI.Stop() has a 15 s belt-and-suspenders timeout for goroutines
-	// blocked in SECCOMP_IOCTL_NOTIF_RECV (crun cleanup may outlive the container).
-	t.Run("stop", func(t *testing.T) {
-		stopCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-
-		offTask, err := vm.PowerOff(stopCtx)
-		require.NoError(t, err)
-		require.NoError(t, offTask.Wait(stopCtx),
-			"PowerOff must complete within 60 s — vsockVI.Stop() may have deadlocked")
-
-		t.Logf("PowerOff completed; vsockVI.Stop() did not deadlock")
-
-		vi.stopMu.Lock()
-		stopped := vi.stopped
-		vi.stopMu.Unlock()
-		require.True(t, stopped, "vsockIntercept must be marked stopped after PowerOff")
-	})
-}
-
 // TestVMCI_ToolboxBinary_GuestInfoRoundTrip validates that the govmomi/toolbox
 // binary, when volume-overlaid as /usr/bin/vmtoolsd and /usr/bin/vmware-rpctool
 // in a container-backed VM, correctly reads and writes guestinfo through the
-// vcsim AF_VSOCK intercept + GuestRPC server.
+// vcsim GuestRPC Unix socket server (Component A).
 //
 // This test is the acceptance gate for D-97-14 and FU-97-10:
 //
 //   - D-97-14: toolbox binary is the vmtoolsd/vmware-rpctool replacement.
 //   - FU-97-10 (CLOSED): toolbox now supports DataMap framing via VsockChannel,
-//     making the binary compatible with both vcsim (AF_VSOCK intercept) and
-//     real ESX hypervisors (native AF_VSOCK).
+//     making the binary compatible with real ESX hypervisors (native AF_VSOCK)
+//     in addition to the Component-A Unix socket path exercised here.
 //
 // Subtests:
 //  1. vmtoolsd-info-set: info-set KEY VAL → value visible in ExtraConfig.
 //  2. vmtoolsd-info-get: info-get KEY → bare value printed to stdout, exit 0.
 //  3. vmware-rpctool-info-get: raw "1 VALUE" response, exit 0 (cloud-init contract).
 //  4. vmtoolsd-info-get-missing: missing key → exit 1, no stdout (cloud-init contract).
-//  5. stop: PowerOff completes cleanly, vsockVI stopped.
+//  5. stop: PowerOff completes cleanly.
 func TestVMCI_ToolboxBinary_GuestInfoRoundTrip(t *testing.T) {
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
@@ -393,7 +147,7 @@ func TestVMCI_ToolboxBinary_GuestInfoRoundTrip(t *testing.T) {
 
 	// ── Create container-backed VM ────────────────────────────────────────
 	// Overlay the toolbox binary as /usr/bin/vmtoolsd (explicit RUN.volume).
-	// /usr/bin/vmware-rpctool is auto-injected by buildVmciArtifacts (RUN.vmci=true).
+	// /usr/bin/vmware-rpctool is auto-injected by buildToolboxArtifact (RUN.vmci=true).
 	// Both dispatch on filepath.Base(os.Args[0]).
 	const key = "guestinfo.toolbox-roundtrip"
 	const val = "hello-from-toolbox"
@@ -409,7 +163,7 @@ func TestVMCI_ToolboxBinary_GuestInfoRoundTrip(t *testing.T) {
 			&types.OptionValue{Key: "RUN.vmci", Value: "true"},
 			// Inject the toolbox binary as /usr/bin/vmtoolsd so vmtoolsd --cmd
 			// dispatches on filepath.Base(os.Args[0]) = "vmtoolsd".
-			// /usr/bin/vmware-rpctool is auto-injected by buildVmciArtifacts when
+			// /usr/bin/vmware-rpctool is auto-injected by buildToolboxArtifact when
 			// RUN.vmci=true; no explicit RUN.volume entry needed for it.
 			&types.OptionValue{
 				Key:   "RUN.volume.vmtoolsd",
@@ -526,7 +280,7 @@ func TestVMCI_ToolboxBinary_GuestInfoRoundTrip(t *testing.T) {
 //     Build with: docker build -t docker.io/library/vmci-systemd-init:latest
 //     ./simulator/testdata/vmci-systemd-init/
 //   - RUN.vmci=true: Component A (GuestRPC Unix socket at $VMX_RPC_SOCK) +
-//     Component B (AF_VSOCK seccomp intercept) + toolbox binary injection.
+//     toolbox binary injection.
 //   - RUN.privileged=true: --privileged for systemd, WITHOUT --tmpfs /run.
 //   - vmci-test-writer.service is baked into the image. It runs after
 //     basic.target and calls vmware-rpctool to set guestinfo.vmci-systemd-test.
@@ -586,7 +340,6 @@ func TestVMCI_SystemdInit_GuestInfoRoundTrip(t *testing.T) {
 			&types.OptionValue{Key: ContainerBackingOptionKey, Value: `["` + image + `"]`},
 			// RUN.vmci activates:
 			//   - Component A: GuestRPC Unix socket (VMX_RPC_SOCK=/run/vmware/rpc.sock)
-			//   - Component B: AF_VSOCK seccomp intercept
 			//   - toolbox binary auto-injected as /usr/bin/vmware-rpctool
 			&types.OptionValue{Key: "RUN.vmci", Value: "true"},
 			// RUN.privileged: adds --privileged so systemd can mount cgroups.
@@ -664,11 +417,6 @@ func TestVMCI_SystemdInit_GuestInfoRoundTrip(t *testing.T) {
 //   - guestinfo.vmci-systemd-test never set: vmware-rpctool cannot connect to the
 //     GuestRPC socket because /run/vmware/rpc.sock is hidden by --tmpfs /run.
 //     Fixed by bind-mounting the directory /run/vmware/ instead of the file.
-//
-//   - ADDFD: inappropriate ioctl for device: AF_VSOCK socket() calls from
-//     nested-container processes (containerd, runc) fail ADDFD. These are warnings
-//     for processes not targeted by the test; they do not kill the outer event loop
-//     as long as the outer container process tree stays alive.
 //
 // # Build prerequisite
 //

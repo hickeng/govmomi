@@ -13,13 +13,11 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	// Remove any leftover vcsim GuestRPC and vsock sockets from previously
-	// crashed test runs.  A fresh Start() would also remove them, but sweeping
-	// here catches all patterns before any test even begins.
+	// Remove any leftover vcsim GuestRPC sockets from previously crashed test
+	// runs.  A fresh Start() would also remove them, but sweeping here catches
+	// all patterns before any test even begins.
 	for _, pattern := range []string{
 		filepath.Join(os.TempDir(), "vcsim-rpc-*.sock"),
-		filepath.Join(os.TempDir(), "vcsim-vsock-*.sock"),
-		filepath.Join(os.TempDir(), "vcsim-vsock-filter-*.json"),
 	} {
 		if matches, err := filepath.Glob(pattern); err == nil {
 			for _, f := range matches {

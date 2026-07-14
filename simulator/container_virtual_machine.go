@@ -26,7 +26,9 @@
 //     kind-style nested-containers setup (which adds --tmpfs /run and conflicts
 //     with the RUN.vmci GuestRPC socket bind-mount at /run/vmware/rpc.sock).
 //     For full Kubernetes-in-container workloads, use RUN.nestedContainers=true
-//     instead.
+//     instead. Note: RUN.nestedContainers=true forces privileged to true
+//     regardless of this key's value, since the full nested-containers flag
+//     set already implies --privileged.
 //
 //   - RUN.nestedContainers: Boolean (default: false). Enable nested container mode
 //     for running Kubernetes or other container workloads inside the container.
@@ -36,14 +38,14 @@
 //     --volume /var, --volume /lib/modules:/lib/modules:ro, --device /dev/fuse.
 //     Reference: https://github.com/kubernetes-sigs/kind/blob/main/pkg/cluster/internal/providers/docker/provision.go
 //
-//   - RUN.vmci: Boolean. Activate the VMCI simulation layer.
-//     Component A: GuestRPC unix socket server — injects the socket at
+//   - RUN.vmci: Boolean. Activate the VMCI simulation layer (Component A):
+//     a per-VM GuestRPC unix socket server — injects the socket at
 //     /run/vmware/rpc.sock and sets VMX_RPC_SOCK so vmware-rpctool (toolbox
 //     binary) uses it. Clients must tolerate AF_VSOCK being unavailable and
-//     fall back to the VMX_RPC_SOCK unix socket path.
-//     Component B (AF_VSOCK seccomp interception) is currently disabled; see
-//     docs/specs/components/97-vcsim-vsock-guestrpc.md for the design and
-//     future-enhancement notes on port-differentiated VMCI simulation.
+//     fall back to the VMX_RPC_SOCK unix socket path. A seccomp-based AF_VSOCK
+//     interception layer ("Component B") is tracked as future work; see
+//     docs/specs/components/97-vcsim-vsock-guestrpc.md and the
+//     vcsim-sv2-enablement-vsock-component-b branch.
 //
 //   - RUN.port.<containerPort>: Map container port to host port.
 //     Example: RUN.port.80 = "8080" maps container port 80 to host port 8080.
@@ -119,7 +121,6 @@ type simVM struct {
 	vm       *VirtualMachine
 	c        *container
 	guestRPC *GuestRPCServer // non-nil when RUN.vmci=true; per-VM unix socket RPCI server
-	vsockVI  *vsockIntercept // reserved; nil while AF_VSOCK interception is disabled
 }
 
 // createSimulationVM inspects the provided VirtualMachine and creates a simVM binding for it if
@@ -145,21 +146,41 @@ func createSimulationVM(vm *VirtualMachine) *simVM {
 // syncNetworkConfigToVMGuestProperties applies container network settings to
 // vm.Guest properties and triggers granular property-change notifications.
 //
-// The inspect() call happens outside the lock to avoid holding it during I/O.
-// ctx.AutoUpdate acquires the VM lock once for the whole checkpoint → modify →
-// diff → update sequence, preventing races with concurrent SOAP handlers
-// (e.g. DestroyTask) that also hold the VM lock.
-func (svm *simVM) syncNetworkConfigToVMGuestProperties(ctx *Context) error {
+// out and detail are an already-fetched docker/podman inspect result (e.g.
+// from watchContainer's update loop, which must inspect anyway to detect
+// container removal). Pass detail == nil to have this function perform its
+// own inspect(); this is the path used when no fresher inspect result is
+// already in hand (e.g. immediately after PowerOn).
+//
+// The inspect() call, when performed here, happens outside the lock to avoid
+// holding it during I/O. ctx.AutoUpdate acquires the VM lock once for the
+// whole checkpoint → modify → diff → update sequence, preventing races with
+// concurrent SOAP handlers (e.g. DestroyTask) that also hold the VM lock.
+func (svm *simVM) syncNetworkConfigToVMGuestProperties(ctx *Context, out []byte, detail *containerDetails) error {
 	if svm == nil || ctx == nil {
 		return nil
 	}
 
-	out, detail, err := svm.c.inspect()
-	if err != nil {
-		return err
+	if detail == nil {
+		o, d, err := svm.c.inspect()
+		if err != nil {
+			return err
+		}
+		out = o
+		detail = &d
 	}
 
 	// Precompute values that don't need the VM lock.
+	//
+	// primaryNet is chosen by taking an arbitrary entry from Go's randomized
+	// map iteration over multi-network containers. This is intentional, not
+	// merely tolerated: real vCenter's algorithm for selecting a VM's primary
+	// network/IP among several attached networks is not confirmed here, so
+	// relying on a stable (e.g. sorted) selection would let tests silently
+	// depend on an ordering assumption that may not hold against the real
+	// system. Randomizing forces that assumption to surface as flake instead
+	// of hiding as false confidence. See spec 90 (testing-and-simulation) for
+	// the open item to align this with confirmed real-VC behavior.
 	primaryNet := detail.NetworkSettings.networkSettings
 	for _, n := range detail.NetworkSettings.Networks {
 		primaryNet = n
@@ -483,26 +504,14 @@ func (svm *simVM) start(ctx *Context) error {
 		extraVolumes = append(extraVolumes, guestRPCVolumeMount(socketDirPath))
 		env = append(env, "VMX_RPC_SOCK="+GuestRPCSocketName)
 
-		// Build the vmci-guest test agent and the toolbox binary (once per process).
-		guestBin, toolboxBin, shimBuildErr := buildVmciArtifacts()
+		// Build the toolbox binary (once per process).
+		toolboxBin, shimBuildErr := buildToolboxArtifact()
 		if shimBuildErr != nil {
-			log.Printf("%s: vmci artifact build failed (%v); vmware-rpctool auto-injection skipped", svm.vm.Name, shimBuildErr)
-		} else {
-			// Inject the vmci-guest static binary at /vmci-guest for test
-			// subcommands (grpc-set, grpc-get, bidi, …).
-			// Skip if the caller has already bound this destination explicitly
-			// (e.g. TestContainerGuestRPC_VsockIntercept which builds its own copy).
-			if !hasVolumeDest(svm.vm.Config.ExtraConfig, "/vmci-guest") {
-				extraVolumes = append(extraVolumes, guestBin+":/vmci-guest:ro")
-			}
-
+			log.Printf("%s: toolbox artifact build failed (%v); vmware-rpctool auto-injection skipped", svm.vm.Name, shimBuildErr)
+		} else if toolboxBin != "" && !hasVolumeDest(svm.vm.Config.ExtraConfig, "/usr/bin/vmware-rpctool") {
 			// Inject the govmomi/toolbox binary at /usr/bin/vmware-rpctool.
-			// It uses AF_VSOCK + DataMap framing (no backdoor instruction) and
-			// works with both the vcsim seccomp intercept and real ESX.
 			// Skip if the caller already bound this destination explicitly.
-			if toolboxBin != "" && !hasVolumeDest(svm.vm.Config.ExtraConfig, "/usr/bin/vmware-rpctool") {
-				extraVolumes = append(extraVolumes, toolboxBin+":/usr/bin/vmware-rpctool:ro")
-			}
+			extraVolumes = append(extraVolumes, toolboxBin+":/usr/bin/vmware-rpctool:ro")
 		}
 	}
 
@@ -541,7 +550,7 @@ func (svm *simVM) start(ctx *Context) error {
 	// Sync network config, retrying a few times to allow the container to get an IP
 	// Container runtimes may take a moment to assign an IP address after start
 	for i := 0; i < 5; i++ {
-		if err = svm.syncNetworkConfigToVMGuestProperties(ctx); err != nil {
+		if err = svm.syncNetworkConfigToVMGuestProperties(ctx, nil, nil); err != nil {
 			log.Printf("%s inspect %s: %s", svm.vm.Name, svm.c.id, err)
 			break
 		}
@@ -551,7 +560,7 @@ func (svm *simVM) start(ctx *Context) error {
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	callback := func(callbackCtx *Context, details *containerDetails, c *container) error {
+	callback := func(callbackCtx *Context, out []byte, details *containerDetails, c *container) error {
 		// c.id is written under c.Lock() in container.remove(). Read it under the
 		// same lock so the race detector does not fire when DestroyTask concurrently
 		// calls c.remove() while this callback is running.
@@ -576,14 +585,14 @@ func (svm *simVM) start(ctx *Context) error {
 			}
 		}
 
-		return svm.syncNetworkConfigToVMGuestProperties(callbackCtx)
+		return svm.syncNetworkConfigToVMGuestProperties(callbackCtx, out, details)
 	}
 
 	// Start watching the container resource.
 	err = svm.c.watchContainer(ctx, callback)
 	if _, ok := err.(uninitializedContainer); ok {
 		// the container has been deleted before we could watch, despite successful launch so clean up.
-		callback(ctx, nil, svm.c)
+		callback(ctx, nil, nil, svm.c)
 
 		// successful launch so nil the error
 		return nil
@@ -604,9 +613,6 @@ func (svm *simVM) stop(ctx *Context) error {
 		return err
 	}
 
-	if svm.vsockVI != nil {
-		svm.vsockVI.Stop()
-	}
 	if svm.guestRPC != nil {
 		svm.guestRPC.Stop()
 	}
@@ -658,14 +664,6 @@ func (svm *simVM) remove(ctx *Context) error {
 		return nil
 	}
 
-	// vsockVI is nil while Component B (AF_VSOCK interception) is disabled.
-	// The stop-before-intercept ordering is preserved for when it is re-enabled.
-	if svm.vsockVI != nil {
-		if err := svm.c.stop(ctx); err != nil {
-			log.Printf("%s remove: pre-vsock stop: %v", svm.vm.Name, err)
-		}
-		svm.vsockVI.Stop()
-	}
 	if svm.guestRPC != nil {
 		svm.guestRPC.Stop()
 	}

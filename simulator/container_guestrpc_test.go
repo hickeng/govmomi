@@ -74,13 +74,6 @@ func buildVsockTestBinary(t *testing.T) string {
 	return buildStaticBinary(t, "github.com/vmware/govmomi/simulator/testdata/vsock-test", "vsock-test")
 }
 
-// buildVmciGuestBinary builds the combined VMCI/vsock test agent binary.
-// This binary covers all vsock-intercept scenarios and replaces the former
-// vsock-test-intercept binary.
-func buildVmciGuestBinary(t *testing.T) string {
-	return buildStaticBinary(t, "github.com/vmware/govmomi/simulator/testdata/vmci-guest", "vmci-guest")
-}
-
 // TestContainerGuestRPC_RoundTrip is the Phase 3 integration gate:
 // a real container process writes guestinfo via the GuestRPC unix socket, and
 // the test verifies the value appears in ExtraConfig via PropertyCollector.
@@ -156,7 +149,7 @@ func TestContainerGuestRPC_RoundTrip(t *testing.T) {
 
 	offTask, err := vm.PowerOff(goCtx)
 	require.NoError(t, err)
-	_ = offTask.Wait(goCtx)
+	require.NoError(t, offTask.Wait(goCtx))
 }
 
 // TestContainerGuestRPC_MultiVM verifies that N concurrent container-backed VMs
@@ -238,99 +231,6 @@ func TestContainerGuestRPC_MultiVM(t *testing.T) {
 	for _, entry := range vms {
 		offTask, err := entry.vm.PowerOff(goCtx)
 		require.NoError(t, err)
-		_ = offTask.Wait(goCtx)
+		require.NoError(t, offTask.Wait(goCtx))
 	}
-}
-
-// TestContainerGuestRPC_VsockIntercept is the Phase 5 integration gate.
-// It exercises the COMPLETE vsock path end-to-end:
-//
-//	AF_VSOCK syscall (socket+connect) in container
-//	  → seccomp SCMP_ACT_NOTIFY intercept
-//	    → socketpair FD injected into container process
-//	      → host-end bridged to per-VM GuestRPC unix socket
-//	        → GuestRPC server info-set/info-get
-//	          → ExtraConfig updated
-//	            → PropertyCollector sees the change
-//
-// Unlike TestContainerGuestRPC_RoundTrip (which talks to the unix socket
-// directly), this test confirms that the seccomp intercept transparently
-// redirects AF_VSOCK calls without the container process needing any
-// knowledge of the simulation layer.
-//
-// Uses RUN.vmci=true (canonical key) and the vmci-guest binary
-// (grpc-roundtrip subcommand), volume-mounted at container start.
-func TestContainerGuestRPC_VsockIntercept(t *testing.T) {
-	if !test.HasDocker() {
-		t.Skip("requires docker or podman (aliased as docker) on linux")
-	}
-
-	interceptBin := buildVmciGuestBinary(t)
-
-	goCtx := context.Background()
-	m := VPX()
-	defer m.Remove()
-	require.NoError(t, m.Create())
-	s := m.Service.NewServer()
-	defer s.Close()
-
-	c, err := govmomi.NewClient(goCtx, s.URL, true)
-	require.NoError(t, err)
-
-	finder := find.NewFinder(c.Client)
-	pool, err := finder.ResourcePool(goCtx, "DC0_H0/Resources")
-	require.NoError(t, err)
-	dc, err := finder.Datacenter(goCtx, "DC0")
-	require.NoError(t, err)
-
-	const key = "guestinfo.vsocktest"
-	const val = "hello-from-vsock-intercept"
-
-	// Run the grpc-roundtrip subcommand then keep the container alive for the
-	// PropertyCollector poll below.
-	cmd := fmt.Sprintf(
-		`/vmci-guest grpc-roundtrip %s %s && sleep 9999`,
-		key, val,
-	)
-
-	spec := types.VirtualMachineConfigSpec{
-		Name: "guestrpc-vsock-intercept-test",
-		Files: &types.VirtualMachineFileInfo{
-			VmPathName: "[LocalDS_0] guestrpc-vsock-intercept-test",
-		},
-		ExtraConfig: []types.BaseOptionValue{
-			&types.OptionValue{
-				Key:   ContainerBackingOptionKey,
-				Value: fmt.Sprintf(`["alpine","sh","-c",%q]`, cmd),
-			},
-			// RUN.vmci=true enables both the GuestRPC server and the AF_VSOCK seccomp intercept.
-			&types.OptionValue{Key: "RUN.vmci", Value: "true"},
-			&types.OptionValue{Key: "RUN.volume.vmci-guest", Value: interceptBin + ":/vmci-guest:ro"},
-		},
-	}
-
-	require.NoError(t, test.ApplyContainerRuntimeDefaults(&spec))
-
-	f, err := dc.Folders(goCtx)
-	require.NoError(t, err)
-
-	task, err := f.VmFolder.CreateVM(goCtx, spec, pool, nil)
-	require.NoError(t, err)
-
-	info, err := task.WaitForResult(goCtx, nil)
-	require.NoError(t, err)
-
-	vmRef := info.Result.(types.ManagedObjectReference)
-	vm := object.NewVirtualMachine(c.Client, vmRef)
-
-	powerTask, err := vm.PowerOn(goCtx)
-	require.NoError(t, err)
-	require.NoError(t, powerTask.Wait(goCtx))
-
-	env := &vcSimEnv{goCtx: goCtx, simCtx: m.Service.Context, pc: property.DefaultCollector(c.Client)}
-	pollExtraConfig(t, env, vmRef, key, val, 60*time.Second)
-
-	offTask, err := vm.PowerOff(goCtx)
-	require.NoError(t, err)
-	_ = offTask.Wait(goCtx)
 }
