@@ -26,8 +26,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/vmware/govmomi"
-	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/test"
 	"github.com/vmware/govmomi/vim25/types"
@@ -126,24 +124,7 @@ func TestVMCI_ToolboxBinary_GuestInfoRoundTrip(t *testing.T) {
 	toolboxBin := buildToolboxBinary(t)
 
 	// ── Stand up vcsim ────────────────────────────────────────────────────
-	goCtx := context.Background()
-	m := VPX()
-	defer m.Remove()
-	require.NoError(t, m.Create())
-	s := m.Service.NewServer()
-	defer s.Close()
-	simCtx := m.Service.Context
-
-	c, err := govmomi.NewClient(goCtx, s.URL, true)
-	require.NoError(t, err)
-
-	finder := find.NewFinder(c.Client)
-	pool, err := finder.ResourcePool(goCtx, "DC0_H0/Resources")
-	require.NoError(t, err)
-	dc, err := finder.Datacenter(goCtx, "DC0")
-	require.NoError(t, err)
-	f, err := dc.Folders(goCtx)
-	require.NoError(t, err)
+	env := newVCSIMEnv(t)
 
 	// ── Create container-backed VM ────────────────────────────────────────
 	// Overlay the toolbox binary as /usr/bin/vmtoolsd (explicit RUN.volume).
@@ -173,28 +154,28 @@ func TestVMCI_ToolboxBinary_GuestInfoRoundTrip(t *testing.T) {
 	}
 	require.NoError(t, test.ApplyContainerRuntimeDefaults(&spec))
 
-	task, err := f.VmFolder.CreateVM(goCtx, spec, pool, nil)
+	task, err := env.folder.VmFolder.CreateVM(env.goCtx, spec, env.pool, nil)
 	require.NoError(t, err)
-	info, err := task.WaitForResult(goCtx, nil)
+	info, err := task.WaitForResult(env.goCtx, nil)
 	require.NoError(t, err)
 
 	vmRef := info.Result.(types.ManagedObjectReference)
-	vm := object.NewVirtualMachine(c.Client, vmRef)
+	vm := object.NewVirtualMachine(env.client.Client, vmRef)
 
-	powerTask, err := vm.PowerOn(goCtx)
+	powerTask, err := vm.PowerOn(env.goCtx)
 	require.NoError(t, err)
-	require.NoError(t, powerTask.Wait(goCtx))
+	require.NoError(t, powerTask.Wait(env.goCtx))
 
-	vmObj := simCtx.Map.Get(vmRef).(*VirtualMachine)
-	containerID := containerIDFor(t, simCtx, vmObj)
+	vmObj := env.simCtx.Map.Get(vmRef).(*VirtualMachine)
+	containerID := containerIDFor(t, env.simCtx, vmObj)
 
 	// ── TEST 1: vmtoolsd --cmd info-set ───────────────────────────────────
 	t.Run("vmtoolsd-info-set", func(t *testing.T) {
 		// info-set exits 0 and produces no stdout on success.
-		dockerExec(t, goCtx, containerID,
+		dockerExec(t, env.goCtx, containerID,
 			"vmtoolsd", "--cmd", "info-set "+key+" "+val)
 
-		got := readGuestInfoKey(simCtx, vmObj, key)
+		got := readGuestInfoKey(env.simCtx, vmObj, key)
 		require.Equal(t, val, got,
 			"ExtraConfig key %q must be set after vmtoolsd --cmd info-set", key)
 	})
@@ -202,7 +183,7 @@ func TestVMCI_ToolboxBinary_GuestInfoRoundTrip(t *testing.T) {
 	// ── TEST 2: vmtoolsd --cmd info-get ───────────────────────────────────
 	t.Run("vmtoolsd-info-get", func(t *testing.T) {
 		// info-get exits 0 and prints the bare value (no "1 " prefix).
-		out := dockerExec(t, goCtx, containerID,
+		out := dockerExec(t, env.goCtx, containerID,
 			"vmtoolsd", "--cmd", "info-get "+key)
 		require.Equal(t, val, out,
 			"vmtoolsd --cmd info-get must print bare value")
@@ -213,7 +194,7 @@ func TestVMCI_ToolboxBinary_GuestInfoRoundTrip(t *testing.T) {
 		// vmware-rpctool prints the raw "1 VALUE" or "0 ..." response and
 		// always exits 0 on a successful channel round-trip.  cloud-init
 		// parses the "1 " prefix itself.
-		out := dockerExec(t, goCtx, containerID,
+		out := dockerExec(t, env.goCtx, containerID,
 			"vmware-rpctool", "info-get "+key)
 		require.Equal(t, "1 "+val, out,
 			"vmware-rpctool info-get must print raw '1 VALUE' response")
@@ -223,7 +204,7 @@ func TestVMCI_ToolboxBinary_GuestInfoRoundTrip(t *testing.T) {
 	// Verifies the exit-code contract that cloud-init DataSourceVMware depends on:
 	// exit 0 = key found, exit 1 = key missing or channel error.
 	t.Run("vmtoolsd-info-get-missing", func(t *testing.T) {
-		cmd := exec.CommandContext(goCtx, "docker",
+		cmd := exec.CommandContext(env.goCtx, "docker",
 			"exec", containerID,
 			"vmtoolsd", "--cmd", "info-get guestinfo.nonexistent.key")
 		out, err := cmd.Output()
@@ -310,24 +291,7 @@ func TestVMCI_SystemdInit_GuestInfoRoundTrip(t *testing.T) {
 	buildToolboxBinary(t)
 
 	// ── Stand up vcsim ────────────────────────────────────────────────────
-	goCtx := context.Background()
-	m := VPX()
-	defer m.Remove()
-	require.NoError(t, m.Create())
-	s := m.Service.NewServer()
-	defer s.Close()
-	simCtx := m.Service.Context
-
-	c, err := govmomi.NewClient(goCtx, s.URL, true)
-	require.NoError(t, err)
-
-	finder := find.NewFinder(c.Client)
-	pool, err := finder.ResourcePool(goCtx, "DC0_H0/Resources")
-	require.NoError(t, err)
-	dc, err := finder.Datacenter(goCtx, "DC0")
-	require.NoError(t, err)
-	f, err := dc.Folders(goCtx)
-	require.NoError(t, err)
+	env := newVCSIMEnv(t)
 
 	// ── Create container-backed VM ────────────────────────────────────────
 	const guestInfoKey = "guestinfo.vmci-systemd-test"
@@ -349,20 +313,20 @@ func TestVMCI_SystemdInit_GuestInfoRoundTrip(t *testing.T) {
 	}
 	require.NoError(t, test.ApplyContainerRuntimeDefaults(&spec))
 
-	task, err := f.VmFolder.CreateVM(goCtx, spec, pool, nil)
+	task, err := env.folder.VmFolder.CreateVM(env.goCtx, spec, env.pool, nil)
 	require.NoError(t, err)
-	info, err := task.WaitForResult(goCtx, nil)
+	info, err := task.WaitForResult(env.goCtx, nil)
 	require.NoError(t, err)
 
 	vmRef := info.Result.(types.ManagedObjectReference)
-	vm := object.NewVirtualMachine(c.Client, vmRef)
+	vm := object.NewVirtualMachine(env.client.Client, vmRef)
 
-	powerTask, err := vm.PowerOn(goCtx)
+	powerTask, err := vm.PowerOn(env.goCtx)
 	require.NoError(t, err)
-	require.NoError(t, powerTask.Wait(goCtx))
+	require.NoError(t, powerTask.Wait(env.goCtx))
 
-	vmObj := simCtx.Map.Get(vmRef).(*VirtualMachine)
-	containerID := containerIDFor(t, simCtx, vmObj)
+	vmObj := env.simCtx.Map.Get(vmRef).(*VirtualMachine)
+	containerID := containerIDFor(t, env.simCtx, vmObj)
 
 	// ── Poll for guestinfo write ───────────────────────────────────────────
 	// The service runs after network.target; systemd boot in a container
@@ -374,7 +338,7 @@ func TestVMCI_SystemdInit_GuestInfoRoundTrip(t *testing.T) {
 
 	var got string
 	for time.Now().Before(deadline) {
-		got = readGuestInfoKey(simCtx, vmObj, guestInfoKey)
+		got = readGuestInfoKey(env.simCtx, vmObj, guestInfoKey)
 		if got != "" {
 			break
 		}
@@ -438,24 +402,7 @@ func TestVMCI_NestedContainers_GuestInfoRoundTrip(t *testing.T) {
 
 	buildToolboxBinary(t)
 
-	goCtx := context.Background()
-	m := VPX()
-	defer m.Remove()
-	require.NoError(t, m.Create())
-	s := m.Service.NewServer()
-	defer s.Close()
-	simCtx := m.Service.Context
-
-	c, err := govmomi.NewClient(goCtx, s.URL, true)
-	require.NoError(t, err)
-
-	finder := find.NewFinder(c.Client)
-	pool, err := finder.ResourcePool(goCtx, "DC0_H0/Resources")
-	require.NoError(t, err)
-	dc, err := finder.Datacenter(goCtx, "DC0")
-	require.NoError(t, err)
-	f, err := dc.Folders(goCtx)
-	require.NoError(t, err)
+	env := newVCSIMEnv(t)
 
 	const guestInfoKey = "guestinfo.vmci-systemd-test"
 
@@ -473,20 +420,20 @@ func TestVMCI_NestedContainers_GuestInfoRoundTrip(t *testing.T) {
 	}
 	require.NoError(t, test.ApplyContainerRuntimeDefaults(&spec))
 
-	task, err := f.VmFolder.CreateVM(goCtx, spec, pool, nil)
+	task, err := env.folder.VmFolder.CreateVM(env.goCtx, spec, env.pool, nil)
 	require.NoError(t, err)
-	info, err := task.WaitForResult(goCtx, nil)
+	info, err := task.WaitForResult(env.goCtx, nil)
 	require.NoError(t, err)
 
 	vmRef := info.Result.(types.ManagedObjectReference)
-	vm := object.NewVirtualMachine(c.Client, vmRef)
+	vm := object.NewVirtualMachine(env.client.Client, vmRef)
 
-	powerTask, err := vm.PowerOn(goCtx)
+	powerTask, err := vm.PowerOn(env.goCtx)
 	require.NoError(t, err)
-	require.NoError(t, powerTask.Wait(goCtx))
+	require.NoError(t, powerTask.Wait(env.goCtx))
 
-	vmObj := simCtx.Map.Get(vmRef).(*VirtualMachine)
-	containerID := containerIDFor(t, simCtx, vmObj)
+	vmObj := env.simCtx.Map.Get(vmRef).(*VirtualMachine)
+	containerID := containerIDFor(t, env.simCtx, vmObj)
 
 	t.Logf("container %s: polling for %q (up to 120 s)…", containerID, guestInfoKey)
 	const pollInterval = 2 * time.Second
@@ -495,7 +442,7 @@ func TestVMCI_NestedContainers_GuestInfoRoundTrip(t *testing.T) {
 
 	var got string
 	for time.Now().Before(deadline) {
-		got = readGuestInfoKey(simCtx, vmObj, guestInfoKey)
+		got = readGuestInfoKey(env.simCtx, vmObj, guestInfoKey)
 		if got != "" {
 			break
 		}

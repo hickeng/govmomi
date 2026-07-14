@@ -7,15 +7,10 @@ package simulator
 // Phase 3 integration tests: real container writes guestinfo via the GuestRPC
 // unix socket; PropertyCollector sees the change.
 //
-// Phase 5 integration test: real container writes guestinfo via AF_VSOCK
-// syscalls → seccomp intercept → socketpair bridge → GuestRPC server.
-// Exercises the complete vsock interception path end-to-end.
-//
 // Requires Docker (or podman aliased as docker) on Linux.
 // Skip gate: test.HasDocker().
 
 import (
-	"context"
 	"fmt"
 	"io/fs"
 	"os"
@@ -27,10 +22,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/vmware/govmomi"
-	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/object"
-	"github.com/vmware/govmomi/property"
 	"github.com/vmware/govmomi/test"
 	"github.com/vmware/govmomi/vim25/types"
 )
@@ -90,21 +82,7 @@ func TestContainerGuestRPC_RoundTrip(t *testing.T) {
 
 	vsockTestBin := buildVsockTestBinary(t)
 
-	goCtx := context.Background()
-	m := VPX()
-	defer m.Remove()
-	require.NoError(t, m.Create())
-	s := m.Service.NewServer()
-	defer s.Close()
-
-	c, err := govmomi.NewClient(goCtx, s.URL, true)
-	require.NoError(t, err)
-
-	finder := find.NewFinder(c.Client)
-	pool, err := finder.ResourcePool(goCtx, "DC0_H0/Resources")
-	require.NoError(t, err)
-	dc, err := finder.Datacenter(goCtx, "DC0")
-	require.NoError(t, err)
+	env := newVCSIMEnv(t)
 
 	const key = "guestinfo.from.container"
 	const val = "hello-from-container"
@@ -127,29 +105,24 @@ func TestContainerGuestRPC_RoundTrip(t *testing.T) {
 
 	require.NoError(t, test.ApplyContainerRuntimeDefaults(&spec))
 
-	f, err := dc.Folders(goCtx)
+	task, err := env.folder.VmFolder.CreateVM(env.goCtx, spec, env.pool, nil)
 	require.NoError(t, err)
 
-	task, err := f.VmFolder.CreateVM(goCtx, spec, pool, nil)
-	require.NoError(t, err)
-
-	info, err := task.WaitForResult(goCtx, nil)
+	info, err := task.WaitForResult(env.goCtx, nil)
 	require.NoError(t, err)
 
 	vmRef := info.Result.(types.ManagedObjectReference)
-	vm := object.NewVirtualMachine(c.Client, vmRef)
+	vm := object.NewVirtualMachine(env.client.Client, vmRef)
 
-	powerTask, err := vm.PowerOn(goCtx)
+	powerTask, err := vm.PowerOn(env.goCtx)
 	require.NoError(t, err)
-	require.NoError(t, powerTask.Wait(goCtx))
+	require.NoError(t, powerTask.Wait(env.goCtx))
 
-	// Inline poll — this test predates newVCSIMEnv so we keep the explicit client.
-	env := &vcSimEnv{goCtx: goCtx, simCtx: m.Service.Context, pc: property.DefaultCollector(c.Client)}
 	pollExtraConfig(t, env, vmRef, key, val, 30*time.Second)
 
-	offTask, err := vm.PowerOff(goCtx)
+	offTask, err := vm.PowerOff(env.goCtx)
 	require.NoError(t, err)
-	require.NoError(t, offTask.Wait(goCtx))
+	require.NoError(t, offTask.Wait(env.goCtx))
 }
 
 // TestContainerGuestRPC_MultiVM verifies that N concurrent container-backed VMs
@@ -161,25 +134,7 @@ func TestContainerGuestRPC_MultiVM(t *testing.T) {
 
 	vsockTestBin := buildVsockTestBinary(t)
 
-	goCtx := context.Background()
-	m := VPX()
-	defer m.Remove()
-	require.NoError(t, m.Create())
-	s := m.Service.NewServer()
-	defer s.Close()
-
-	c, err := govmomi.NewClient(goCtx, s.URL, true)
-	require.NoError(t, err)
-
-	finder := find.NewFinder(c.Client)
-	pool, err := finder.ResourcePool(goCtx, "DC0_H0/Resources")
-	require.NoError(t, err)
-	dc, err := finder.Datacenter(goCtx, "DC0")
-	require.NoError(t, err)
-	f, err := dc.Folders(goCtx)
-	require.NoError(t, err)
-
-	env := &vcSimEnv{goCtx: goCtx, simCtx: m.Service.Context, pc: property.DefaultCollector(c.Client)}
+	env := newVCSIMEnv(t)
 
 	const n = 2
 	type vmEntry struct {
@@ -210,16 +165,16 @@ func TestContainerGuestRPC_MultiVM(t *testing.T) {
 		}
 		require.NoError(t, test.ApplyContainerRuntimeDefaults(&spec))
 
-		task, err := f.VmFolder.CreateVM(goCtx, spec, pool, nil)
+		task, err := env.folder.VmFolder.CreateVM(env.goCtx, spec, env.pool, nil)
 		require.NoError(t, err)
-		info, err := task.WaitForResult(goCtx, nil)
+		info, err := task.WaitForResult(env.goCtx, nil)
 		require.NoError(t, err)
 
 		ref := info.Result.(types.ManagedObjectReference)
-		vm := object.NewVirtualMachine(c.Client, ref)
-		powerTask, err := vm.PowerOn(goCtx)
+		vm := object.NewVirtualMachine(env.client.Client, ref)
+		powerTask, err := vm.PowerOn(env.goCtx)
 		require.NoError(t, err)
-		require.NoError(t, powerTask.Wait(goCtx))
+		require.NoError(t, powerTask.Wait(env.goCtx))
 
 		vms = append(vms, vmEntry{ref: ref, vm: vm, key: key, val: val})
 	}
@@ -229,8 +184,8 @@ func TestContainerGuestRPC_MultiVM(t *testing.T) {
 	}
 
 	for _, entry := range vms {
-		offTask, err := entry.vm.PowerOff(goCtx)
+		offTask, err := entry.vm.PowerOff(env.goCtx)
 		require.NoError(t, err)
-		require.NoError(t, offTask.Wait(goCtx))
+		require.NoError(t, offTask.Wait(env.goCtx))
 	}
 }

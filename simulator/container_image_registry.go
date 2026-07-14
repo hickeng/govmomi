@@ -94,8 +94,9 @@ func (r *ContainerImageRegistry) Register(e ContainerImageEntry) {
 
 // resolve returns a copy of the first entry that matches the given VM, or a
 // zero-value entry if no match is found. Check OCIImage != "" to detect a match.
-// The caller holds no VM lock; the VM's Config fields are read under the
-// registry's own read-lock only.
+// The caller is not required to hold a VM lock: the lock taken here (the
+// registry's own read-lock) only guards the registry's entries against
+// concurrent Register calls, not the VM's own Config fields.
 func (r *ContainerImageRegistry) resolve(vm *VirtualMachine) ContainerImageEntry {
 	if r == nil {
 		return ContainerImageEntry{}

@@ -81,23 +81,27 @@ func TestPropertyDiff_NestedFields(t *testing.T) {
 	// Get the diff
 	changes := PropertyDiff(checkpoint, vm)
 
-	// We should have changes for guest and summary.guest
-	require.Len(t, changes, 2, "expected at least 2 changes, got %d: %+v", len(changes), changes)
+	// Guest is an anonymous-free pointer field, so its change is reported
+	// under its own path ("guest"). Summary is a non-anonymous value-typed
+	// field that diffFields does not recurse into, so any change inside it
+	// -- including this one, nested under Summary.Guest -- is reported as a
+	// single opaque "summary" change, not a fine-grained "summary.guest" path.
+	require.Len(t, changes, 2, "expected 2 changes, got %d: %+v", len(changes), changes)
 
 	// Check that we have the expected property paths
 	foundGuest := false
-	foundSummaryGuest := false
+	foundSummary := false
 	for _, c := range changes {
 		if c.Name == "guest" {
 			foundGuest = true
 		}
 		if c.Name == "summary" {
-			foundSummaryGuest = true
+			foundSummary = true
 		}
 	}
 
 	assert.True(t, foundGuest, "expected change for 'guest' property")
-	assert.True(t, foundSummaryGuest, "expected change for 'summary' property")
+	assert.True(t, foundSummary, "expected change for 'summary' property")
 }
 
 func TestPropertyDiff_AddRemove(t *testing.T) {
@@ -181,6 +185,32 @@ func TestPropertyDiff_SliceFields(t *testing.T) {
 	}
 
 	t.Error("expected change for 'guest' property containing network changes")
+}
+
+// TestPropertyDiff_NilVsEmptySlice verifies that a nil slice and a non-nil,
+// zero-length slice of the same field are treated as equal (no
+// PropertyChange), even though reflect.DeepEqual alone would consider them
+// different. Without this, a transition like the one
+// syncNetworkConfigToVMGuestProperties performs -- assigning a nil
+// []types.GuestNicInfo when a container has no NICs -- would report a
+// spurious "guest" change against a checkpoint whose Net field happened to
+// be a non-nil empty slice, even though nothing observable changed.
+func TestPropertyDiff_NilVsEmptySlice(t *testing.T) {
+	vm := &mo.VirtualMachine{
+		Guest: &types.GuestInfo{
+			Net: []types.GuestNicInfo{}, // non-nil, empty
+		},
+	}
+	vm.Self = types.ManagedObjectReference{Type: "VirtualMachine", Value: "vm-1"}
+
+	checkpoint := Checkpoint(vm)
+
+	vm.Guest.Net = nil // nil, empty
+
+	changes := PropertyDiff(checkpoint, vm)
+
+	require.Len(t, changes, 0,
+		"nil slice and non-nil empty slice must not produce a change, got %d: %+v", len(changes), changes)
 }
 
 func TestCheckpoint(t *testing.T) {
@@ -438,10 +468,10 @@ func TestContext_Checkpoint(t *testing.T) {
 	})
 }
 
-// TestContext_PropertyDiff verifies that ctx.PropertyDiff computes changes from an old
+// TestContext_UpdateDiff verifies that ctx.UpdateDiff computes changes from an old
 // snapshot to the current live state and applies them so they are visible via the
 // PropertyCollector.
-func TestContext_PropertyDiff(t *testing.T) {
+func TestContext_UpdateDiff(t *testing.T) {
 	goCtx := context.Background()
 
 	m := VPX()
@@ -622,7 +652,10 @@ func TestPropertyDiff_GuestNetInfo(t *testing.T) {
 	assert.True(t, foundGuest, "expected change for 'guest' property")
 }
 
-// TestPropertyDiff_SummaryGuest tests that summary.guest changes are tracked
+// TestPropertyDiff_SummaryGuest tests that a change nested under
+// Summary.Guest is tracked, reported as a single opaque "summary" change
+// (Summary is a non-anonymous value-typed field that diffFields does not
+// recurse into).
 func TestPropertyDiff_SummaryGuest(t *testing.T) {
 	vm := &mo.VirtualMachine{
 		Summary: types.VirtualMachineSummary{

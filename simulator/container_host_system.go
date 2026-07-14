@@ -203,8 +203,13 @@ func createSimulationHost(ctx *Context, host *HostSystem) (*simHost, error) {
 	}
 	execCmds = append(execCmds, netCmds...)
 
-	// create the container (nestedContainers=false for host simulation)
-	sh.c, err = create(ctx, hName, hUuid, dockerNet, dockerVol, nil, dockerEnv, false, false, "", "alpine:3.20.3", []string{"sleep", "infinity"}, true)
+	// create the container (host simulation: no privilege escalation, no nested containers)
+	sh.c, err = create(ctx, hName, hUuid, "alpine:3.20.3", []string{"sleep", "infinity"}, createOptions{
+		Networks:          dockerNet,
+		Volumes:           dockerVol,
+		Env:               dockerEnv,
+		QuoteImageAndArgs: true,
+	})
 	if err != nil {
 		return nil, err
 	}

@@ -70,11 +70,7 @@ func validateNginxContainer(t *testing.T, vm *object.VirtualMachine, expected st
 	// Verify direct container IP access.  Join the same bridge as the nginx
 	// container so the probe can reach it; omit --network on runtimes where
 	// the default bridge provides connectivity.
-	probeArgs := []string{"run", "--rm"}
-	if network != "" {
-		probeArgs = append(probeArgs, "--network", network)
-	}
-	probeArgs = append(probeArgs, "curlimages/curl", "curl", "-f", fmt.Sprintf("http://%s:80", ip))
+	probeArgs := test.ContainerCurlProbeArgs(network, fmt.Sprintf("http://%s:80", ip))
 	cmd := exec.Command("docker", probeArgs...)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf

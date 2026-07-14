@@ -23,8 +23,8 @@ func IsVsockAvailable() bool { return false }
 func (c *VsockChannel) Start() error {
 	return errors.New("VsockChannel: AF_VSOCK is only supported on Linux")
 }
-func (c *VsockChannel) Stop() error             { return nil }
-func (c *VsockChannel) Send(_ []byte) error     { return errors.New("VsockChannel: not started") }
+func (c *VsockChannel) Stop() error         { return nil }
+func (c *VsockChannel) Send(_ []byte) error { return errors.New("VsockChannel: not started") }
 func (c *VsockChannel) Receive() ([]byte, error) {
 	return nil, errors.New("VsockChannel: not started")
 }

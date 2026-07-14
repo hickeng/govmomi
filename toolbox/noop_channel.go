@@ -18,7 +18,7 @@ type noopChannel struct{}
 // host-to-guest DialVM is not yet implemented).
 func NewNoopChannelIn() Channel { return &noopChannel{} }
 
-func (c *noopChannel) Start() error          { return nil }
-func (c *noopChannel) Stop() error           { return nil }
-func (c *noopChannel) Send(_ []byte) error   { return nil }
+func (c *noopChannel) Start() error             { return nil }
+func (c *noopChannel) Stop() error              { return nil }
+func (c *noopChannel) Send(_ []byte) error      { return nil }
 func (c *noopChannel) Receive() ([]byte, error) { return nil, nil }

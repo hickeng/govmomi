@@ -67,7 +67,6 @@ func (s *ServiceInstance) RetrieveServiceContent(ctx *simulator.Context, _ *type
 	}
 }
 
-
 type ServiceRegistration struct {
 	vim.ManagedObjectReference
 
@@ -158,15 +157,15 @@ func (s *ServiceRegistration) Create(ctx *simulator.Context, req *types.Create) 
 	}
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	for i, existing := range s.Info {
 		if existing.ServiceId == req.ServiceId {
 			s.Info[i] = entry
-			s.mu.Unlock()
 			return &methods.CreateBody{Res: new(types.CreateResponse)}
 		}
 	}
 	s.Info = append(s.Info, entry)
-	s.mu.Unlock()
 
 	return &methods.CreateBody{Res: new(types.CreateResponse)}
 }

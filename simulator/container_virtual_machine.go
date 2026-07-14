@@ -522,7 +522,16 @@ func (svm *simVM) start(ctx *Context) error {
 	volumes = append(volumes, extraVolumes...)
 
 	var err error
-	svm.c, err = create(ctx, svm.vm.Name, svm.vm.uid.String(), networks, volumes, ports, env, privileged, nestedContainers, "" /* seccompProfile: Component B disabled */, args[0], args[1:], jsonArgs)
+	svm.c, err = create(ctx, svm.vm.Name, svm.vm.uid.String(), args[0], args[1:], createOptions{
+		Networks:          networks,
+		Volumes:           volumes,
+		Ports:             ports,
+		Env:               env,
+		Privileged:        privileged,
+		NestedContainers:  nestedContainers,
+		SeccompProfile:    "", // Component B (AF_VSOCK seccomp intercept) removed; see vcsim-sv2-enablement-vsock-component-b
+		QuoteImageAndArgs: jsonArgs,
+	})
 	if err != nil {
 		return err
 	}

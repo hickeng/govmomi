@@ -97,15 +97,13 @@ func pollExtraConfig(t *testing.T, env *vcSimEnv, vmRef types.ManagedObjectRefer
 	t.Fatalf("timeout after %s: %q not found in ExtraConfig", timeout, key)
 }
 
-// removeStaleGuestRPCSockets removes vcsim-rpc-*.sock and related stale files
-// left by previously crashed test runs.  TestMain calls the equivalent sweep
-// before the entire test binary runs; this function is available for tests that
+// removeStaleGuestRPCSockets removes vcsim-rpc-*.sock stale files left by
+// previously crashed test runs.  TestMain calls the equivalent sweep before
+// the entire test binary runs; this function is available for tests that
 // need an extra clean before a specific sensitive operation.
 func removeStaleGuestRPCSockets() {
 	for _, pattern := range []string{
 		filepath.Join(os.TempDir(), "vcsim-rpc-*.sock"),
-		filepath.Join(os.TempDir(), "vcsim-vsock-*.sock"),
-		filepath.Join(os.TempDir(), "vcsim-vsock-filter-*.json"),
 	} {
 		if matches, err := filepath.Glob(pattern); err == nil {
 			for _, f := range matches {
@@ -135,7 +133,7 @@ func firstVM(simCtx *Context) *VirtualMachine {
 
 // TestGuestRPCServer_InfoGetSet exercises basic info-get and info-set.
 func TestGuestRPCServer_InfoGetSet(t *testing.T) {
-		env := newVCSIMEnv(t)
+	env := newVCSIMEnv(t)
 
 	vmObj := firstVM(env.simCtx)
 	require.NotNil(t, vmObj, "no VMs in test inventory")
@@ -160,7 +158,7 @@ func TestGuestRPCServer_InfoGetSet(t *testing.T) {
 // TestGuestRPCServer_InfoSet_PropertyChange verifies info-set triggers a
 // PropertyCollector notification.
 func TestGuestRPCServer_InfoSet_PropertyChange(t *testing.T) {
-		env := newVCSIMEnv(t)
+	env := newVCSIMEnv(t)
 
 	vmObj := firstVM(env.simCtx)
 	require.NotNil(t, vmObj)
@@ -181,7 +179,7 @@ func TestGuestRPCServer_InfoSet_PropertyChange(t *testing.T) {
 
 // TestGuestRPCServer_RoundTrip tests host-write/guest-read and guest-write/host-read.
 func TestGuestRPCServer_RoundTrip(t *testing.T) {
-		env := newVCSIMEnv(t)
+	env := newVCSIMEnv(t)
 
 	vmObj := firstVM(env.simCtx)
 	require.NotNil(t, vmObj)
@@ -220,9 +218,12 @@ func TestGuestRPCServer_RoundTrip(t *testing.T) {
 	require.Equal(t, "guestvalue", gotValue)
 }
 
-// TestGuestRPCServer_ConcurrentVMs verifies independent servers for concurrent VMs.
-func TestGuestRPCServer_ConcurrentVMs(t *testing.T) {
-		env := newVCSIMEnv(t)
+// TestGuestRPCServer_MultiVM verifies that two coexisting VMs each get an
+// independent GuestRPC server, and that one VM's guestinfo keys are not
+// visible to the other. The two VMs' servers are exercised sequentially, not
+// concurrently; this test is about isolation, not concurrency.
+func TestGuestRPCServer_MultiVM(t *testing.T) {
+	env := newVCSIMEnv(t)
 
 	refs := env.simCtx.Map.AllReference("VirtualMachine")
 	if len(refs) < 2 {
@@ -288,6 +289,7 @@ func TestGuestRPCServer_Cleanup(t *testing.T) {
 
 	srv := newGuestRPCServer(vmObj, socketPath)
 	require.NoError(t, srv.Start(env.simCtx), "Start with stale file")
+	t.Cleanup(srv.Stop) // idempotent (sync.Once); also covers early-return on assertion failure below
 
 	fi, err := os.Stat(socketPath)
 	require.NoError(t, err)

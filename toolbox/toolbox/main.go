@@ -23,9 +23,9 @@
 //  2. AF_VSOCK with DataMap framing.  Works on:
 //     • Real ESX VMs with the vmci kernel module loaded.
 //     • govmomi/simulator container-backed VMs (RUN.vmci=true via seccomp
-//       intercept that replaces the vsock FD with a Unix socketpair) — reliable
-//       only during the crun-managed phase of container startup, before exec into
-//       systemd or nested-container runtimes invalidate the seccomp notification FD.
+//     intercept that replaces the vsock FD with a Unix socketpair) — reliable
+//     only during the crun-managed phase of container startup, before exec into
+//     systemd or nested-container runtimes invalidate the seccomp notification FD.
 //
 //  3. x86 backdoor channel (in eax,dx / port 0x5658) — fallback when neither
 //     VMX_RPC_SOCK nor AF_VSOCK is available (VMware Workstation/Fusion, or ESX
