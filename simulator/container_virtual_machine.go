@@ -179,8 +179,9 @@ func (svm *simVM) syncNetworkConfigToVMGuestProperties(ctx *Context, out []byte,
 	// relying on a stable (e.g. sorted) selection would let tests silently
 	// depend on an ordering assumption that may not hold against the real
 	// system. Randomizing forces that assumption to surface as flake instead
-	// of hiding as false confidence. See spec 90 (testing-and-simulation) for
-	// the open item to align this with confirmed real-VC behavior.
+	// of hiding as false confidence. See FU-90-16 in spec 90
+	// (testing-and-simulation) for the open item to align this with
+	// confirmed real-VC behavior.
 	primaryNet := detail.NetworkSettings.networkSettings
 	for _, n := range detail.NetworkSettings.Networks {
 		primaryNet = n
